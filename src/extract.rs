@@ -11,6 +11,25 @@ use mlua_typegen::{
 };
 use mlua_typegen::typemap::map_rust_type;
 
+/// Sentinel value used to mark "returns Self" during extraction.
+/// `extract_class` replaces this with the actual class name.
+fn self_return_sentinel() -> LuaType {
+    LuaType::Class(String::new())
+}
+
+fn is_self_return_sentinel(ty: &LuaType) -> bool {
+    matches!(ty, LuaType::Class(name) if name.is_empty())
+}
+
+/// Check whether a type is `mlua::AnyUserData` (possibly wrapped in `Result`).
+fn is_any_user_data(tcx: TyCtxt<'_>, ty: ty::Ty<'_>) -> bool {
+    if let ty::TyKind::Adt(adt_def, _) = ty.kind() {
+        tcx.def_path_str(adt_def.did()).ends_with("AnyUserData")
+    } else {
+        false
+    }
+}
+
 /// Walk statements in a loop body block, calling `$visitor` on each expression.
 /// Uses a macro to avoid lifetime issues with `TyCtxt`'s invariant lifetime parameter.
 macro_rules! walk_loop_body {
@@ -575,14 +594,14 @@ fn extract_class<'tcx>(
 
     let doc = extract_type_doc(tcx, self_ty);
 
-    // Builder pattern fix: add_function/add_function_mut methods that take
-    // AnyUserData as first param and return AnyUserData (→ any) are actually
-    // returning Self for method chaining. Replace `any` return with the class.
+    // Replace Self return sentinels with the actual class name.
+    // These are set by extract_closure_signature when it detects the builder
+    // pattern: add_function taking AnyUserData and returning AnyUserData.
     for method in &mut methods {
-        if method.kind == MethodKind::Function
-            && method.returns == [LuaType::Any]
-        {
-            method.returns = vec![LuaType::Class(class_name.clone())];
+        for ret in &mut method.returns {
+            if is_self_return_sentinel(ret) {
+                *ret = LuaType::Class(class_name.clone());
+            }
         }
     }
 
@@ -683,6 +702,7 @@ fn visit_expr_for_methods<'tcx>(
                 // All function variants (immutable, mutable, async)
                 "add_function" | "add_function_mut"
                 | "add_async_function" => {
+
                     if let Some(m) = extract_single_method(tcx, args, MethodKind::Function, is_async) {
                         methods.push(m);
                     }
@@ -870,26 +890,46 @@ fn extract_closure_signature(
 
     let params = if params_idx < inner_inputs.len() {
         let user_params_ty = inner_inputs[params_idx];
-        // For add_function/add_function_mut, the params tuple is (AnyUserData, actual_params...)
-        // We need to skip the AnyUserData self param
+        // For add_function/add_function_mut, the first param is AnyUserData (self).
+        // Detect this and skip it from the Lua-visible params.
         if kind == MethodKind::Function {
-            if let ty::TyKind::Tuple(fields) = user_params_ty.kind() {
-                if fields.len() >= 2 {
+            let first_is_any_user_data = match user_params_ty.kind() {
+                // Single param: just AnyUserData (no extra args)
+                ty::TyKind::Adt(adt_def, _) => {
+                    tcx.def_path_str(adt_def.did()).ends_with("AnyUserData")
+                }
+                // Multiple params: (AnyUserData, actual_args...)
+                ty::TyKind::Tuple(fields) if !fields.is_empty() => {
                     if let ty::TyKind::Adt(adt_def, _) = fields[0].kind() {
-                        let path = tcx.def_path_str(adt_def.did());
-                        if path.ends_with("AnyUserData") {
-                            // Skip first element (self), extract rest
-                            let rest_names: Vec<String> = hir_param_names.iter().skip(1).cloned().collect();
-                            return Some((
-                                fields.iter().skip(1).enumerate().map(|(i, field_ty)| LuaParam {
-                                    name: rest_names.get(i).cloned().unwrap_or_else(|| format!("p{}", i + 1)),
-                                    ty: map_ty_to_lua(tcx, field_ty),
-                                }).collect(),
-                                map_return_ty(tcx, sig.output()),
-                            ));
-                        }
+                        tcx.def_path_str(adt_def.did()).ends_with("AnyUserData")
+                    } else {
+                        false
                     }
                 }
+                _ => false,
+            };
+
+            if first_is_any_user_data {
+                // Extract params after the AnyUserData self param
+                let params = if let ty::TyKind::Tuple(fields) = user_params_ty.kind() {
+                    let rest_names: Vec<String> = hir_param_names.iter().skip(1).cloned().collect();
+                    fields.iter().skip(1).enumerate().map(|(i, field_ty)| LuaParam {
+                        name: rest_names.get(i).cloned().unwrap_or_else(|| format!("p{}", i + 1)),
+                        ty: map_ty_to_lua(tcx, field_ty),
+                    }).collect()
+                } else {
+                    // Single AnyUserData param → no Lua-visible params
+                    Vec::new()
+                };
+
+                let ret_ty = unwrap_result_ty(tcx, sig.output());
+                let returns = if is_any_user_data(tcx, ret_ty) {
+                    // Builder pattern: returns AnyUserData (self) for chaining.
+                    vec![self_return_sentinel()]
+                } else {
+                    map_return_ty(tcx, sig.output())
+                };
+                return Some((params, returns));
             }
         }
         extract_params_from_tuple(tcx, user_params_ty, &hir_param_names)
@@ -1266,6 +1306,216 @@ fn infer_expr_lua_type(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> LuaType {
     map_ty_to_lua(tcx, ty)
 }
 
+/// Returns true if a LuaType carries useful type information (not Any, Nil, or Function bare).
+fn is_informative(ty: &LuaType) -> bool {
+    !matches!(ty, LuaType::Any | LuaType::Nil | LuaType::Function)
+}
+
+/// Walk a closure body to infer the concrete type when the signature says `Value` (any).
+/// Recursively searches the entire expression tree for `.into_lua()` calls and
+/// returns the type of the receiver — the concrete type before Lua conversion.
+fn infer_concrete_type_from_body<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+) -> Option<LuaType> {
+    let typeck = tcx.typeck(expr.hir_id.owner.def_id);
+    // First try structural inference (Ok(...), blocks, etc.)
+    if let Some(ty) = infer_from_expr(tcx, typeck, expr) {
+        return Some(ty);
+    }
+    // Fall back to a deep search for .into_lua() calls in the entire tree
+    find_into_lua_receiver_type(tcx, expr)
+}
+
+/// Recursively search an expression tree for `.into_lua()` calls and return
+/// the concrete type of the receiver. Crosses closure boundaries to handle
+/// patterns like `borrow_mut_scoped(|me| { ... value.into_lua(lua) })`.
+fn find_into_lua_receiver_type<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+) -> Option<LuaType> {
+    match &expr.kind {
+        hir::ExprKind::MethodCall(segment, receiver, args, _) => {
+            let name = segment.ident.name.as_str();
+            if name == "into_lua" {
+                let typeck = tcx.typeck(receiver.hir_id.owner.def_id);
+                let receiver_ty = typeck.expr_ty(receiver);
+                let lua_ty = map_ty_to_lua(tcx, receiver_ty);
+                if is_informative(&lua_ty) {
+                    return Some(lua_ty);
+                }
+            }
+            // Recurse into receiver and args
+            if let Some(ty) = find_into_lua_receiver_type(tcx, receiver) {
+                return Some(ty);
+            }
+            for arg in *args {
+                if let Some(ty) = find_into_lua_receiver_type(tcx, arg) {
+                    return Some(ty);
+                }
+            }
+            None
+        }
+        hir::ExprKind::Block(block, _) => {
+            // Check all statements and tail
+            for stmt in block.stmts {
+                if let hir::StmtKind::Semi(e) | hir::StmtKind::Expr(e) | hir::StmtKind::Let(hir::LetStmt { init: Some(e), .. }) = &stmt.kind {
+                    if let Some(ty) = find_into_lua_receiver_type(tcx, e) {
+                        return Some(ty);
+                    }
+                }
+            }
+            block.expr.and_then(|e| find_into_lua_receiver_type(tcx, e))
+        }
+        hir::ExprKind::Match(scrut, arms, _) => {
+            if let Some(ty) = find_into_lua_receiver_type(tcx, scrut) {
+                return Some(ty);
+            }
+            for arm in *arms {
+                if let Some(ty) = find_into_lua_receiver_type(tcx, arm.body) {
+                    return Some(ty);
+                }
+            }
+            None
+        }
+        hir::ExprKind::Call(callee, args) => {
+            if let Some(ty) = find_into_lua_receiver_type(tcx, callee) {
+                return Some(ty);
+            }
+            for arg in *args {
+                if let Some(ty) = find_into_lua_receiver_type(tcx, arg) {
+                    return Some(ty);
+                }
+            }
+            None
+        }
+        hir::ExprKind::Closure(inner_closure) => {
+            // Cross closure boundary — the concrete type may be inside
+            let inner_body = tcx.hir_body(inner_closure.body);
+            find_into_lua_receiver_type(tcx, inner_body.value)
+        }
+        hir::ExprKind::If(cond, then_expr, else_expr) => {
+            if let Some(ty) = find_into_lua_receiver_type(tcx, cond) {
+                return Some(ty);
+            }
+            if let Some(ty) = find_into_lua_receiver_type(tcx, then_expr) {
+                return Some(ty);
+            }
+            if let Some(e) = else_expr {
+                find_into_lua_receiver_type(tcx, e)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn infer_from_expr<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typeck: &'tcx ty::TypeckResults<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+) -> Option<LuaType> {
+    match &expr.kind {
+        // .into_lua(lua) — the receiver has the concrete type
+        hir::ExprKind::MethodCall(segment, receiver, _, _)
+            if segment.ident.name.as_str() == "into_lua"
+                || segment.ident.name.as_str() == "into_lua_multi" =>
+        {
+            let receiver_ty = typeck.expr_ty(receiver);
+            let lua_ty = map_ty_to_lua(tcx, receiver_ty);
+            if is_informative(&lua_ty) {
+                return Some(lua_ty);
+            }
+            // Recurse into receiver in case of chained calls
+            infer_from_expr(tcx, typeck, receiver)
+        }
+
+        // Ok(expr) — unwrap and check the inner expression
+        hir::ExprKind::Call(callee, args) => {
+            if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = &callee.kind {
+                if let Some(seg) = path.segments.last() {
+                    if seg.ident.name.as_str() == "Ok" && args.len() == 1 {
+                        return infer_from_expr(tcx, typeck, &args[0]);
+                    }
+                }
+            }
+            // For function calls, check the return type
+            let call_ty = typeck.expr_ty(expr);
+            let lua_ty = map_ty_to_lua(tcx, call_ty);
+            if is_informative(&lua_ty) {
+                Some(lua_ty)
+            } else {
+                None
+            }
+        }
+
+        // Method call chains: expr.method().method2() — check the overall type
+        hir::ExprKind::MethodCall(segment, receiver, args, _) => {
+            let call_ty = typeck.expr_ty(expr);
+            let lua_ty = map_ty_to_lua(tcx, call_ty);
+            if is_informative(&lua_ty) {
+                return Some(lua_ty);
+            }
+            // For scoped borrow methods (borrow_mut_scoped, borrow_scoped),
+            // the concrete type is inside the closure argument's body.
+            let method_name = segment.ident.name.as_str();
+            if method_name.contains("scoped") || method_name.contains("scope") {
+                for arg in *args {
+                    if let hir::ExprKind::Closure(inner_closure) = &arg.kind {
+                        let inner_body = tcx.hir_body(inner_closure.body);
+                        // Inner closure has its own typeck owner
+                        let inner_typeck = tcx.typeck(inner_closure.def_id);
+                        if let Some(ty) = infer_from_expr(tcx, inner_typeck, inner_body.value) {
+                            return Some(ty);
+                        }
+                    }
+                }
+            }
+            infer_from_expr(tcx, typeck, receiver)
+        }
+
+        // Closure body is a block — check the tail expression
+        hir::ExprKind::Block(block, _) => {
+            if let Some(tail) = block.expr {
+                return infer_from_expr(tcx, typeck, tail);
+            }
+            // Check last statement if it's an expression
+            if let Some(stmt) = block.stmts.last() {
+                if let hir::StmtKind::Semi(e) | hir::StmtKind::Expr(e) = &stmt.kind {
+                    return infer_from_expr(tcx, typeck, e);
+                }
+            }
+            None
+        }
+
+        // Match/if expressions — try the first arm
+        hir::ExprKind::Match(_, arms, _) => {
+            for arm in *arms {
+                if let Some(ty) = infer_from_expr(tcx, typeck, arm.body) {
+                    return Some(ty);
+                }
+            }
+            None
+        }
+
+        hir::ExprKind::If(_, then_expr, _) => {
+            infer_from_expr(tcx, typeck, then_expr)
+        }
+
+        // Direct struct/value construction — use typeck
+        _ => {
+            let ty = typeck.expr_ty(expr);
+            let lua_ty = map_ty_to_lua(tcx, ty);
+            if is_informative(&lua_ty) {
+                Some(lua_ty)
+            } else {
+                None
+            }
+        }
+    }
+}
+
 // ── Field extraction ───────────────────────────────────────────────────
 
 fn extract_fields_from_body<'tcx>(
@@ -1407,7 +1657,40 @@ fn extract_field_getter<'tcx>(
     let sig = tcx.liberate_late_bound_regions(closure_def_id.into(), sig);
 
     let ret_ty = sig.output();
-    let ty = map_ty_to_lua(tcx, ret_ty);
+    let unwrapped = unwrap_result_ty(tcx, ret_ty);
+    let mut ty = map_ty_to_lua(tcx, ret_ty);
+
+    // When the closure returns Result<Value> (→ Any), try to infer the concrete
+    // type by walking the closure body for constructor expressions. This handles
+    // cached_field! macros where the type is erased to Value by .into_lua().
+    if ty == LuaType::Any {
+        let body = tcx.hir_body(closure.body);
+        eprintln!("DEBUG BODY: field={name}, body_expr_is_block={}", matches!(&body.value.kind, hir::ExprKind::Block(..)));
+        if let hir::ExprKind::Block(block, _) = &body.value.kind {
+            if let Some(tail) = block.expr {
+                eprintln!("DEBUG BODY: field={name}, block_tail_kind={}", match &tail.kind {
+                    hir::ExprKind::MethodCall(seg, _, _, _) => format!("MethodCall({})", seg.ident.name),
+                    hir::ExprKind::Call(_, _) => "Call".to_string(),
+                    hir::ExprKind::Block(_, _) => "Block".to_string(),
+                    hir::ExprKind::Closure(_) => "Closure".to_string(),
+                    hir::ExprKind::Match(_, _, _) => "Match".to_string(),
+                    hir::ExprKind::If(_, _, _) => "If".to_string(),
+                    hir::ExprKind::Ret(_) => "Ret".to_string(),
+                    hir::ExprKind::Path(_) => "Path".to_string(),
+                    hir::ExprKind::Struct(_, _, _) => "Struct".to_string(),
+                    other => format!("Other({:?})", std::mem::discriminant(other)),
+                });
+            } else {
+                eprintln!("DEBUG BODY: field={name}, no block tail, stmts={}", block.stmts.len());
+            }
+        }
+        if let Some(inferred) = infer_concrete_type_from_body(tcx, body.value) {
+            eprintln!("DEBUG FIELD: name={name}, inferred={inferred:?} from body (was {unwrapped:?})");
+            ty = inferred;
+        } else {
+            eprintln!("DEBUG FIELD: name={name}, ret_ty={ret_ty:?}, unwrapped={unwrapped:?} (no inference)");
+        }
+    }
 
     Some(LuaField {
         name,
