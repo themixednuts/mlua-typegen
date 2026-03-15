@@ -1,0 +1,21 @@
+[package]
+name = "mlua-typegen"
+version = "0.1.0"
+edition = "2024"
+description = "Extract Lua type stubs from mlua UserData impls using rustc's type inference"
+license = "MIT"
+
+[[bin]]
+name = "cargo-mlua-typegen"
+path = "src/main.rs"
+
+[[bin]]
+name = "mlua-typegen-driver"
+path = "src/driver.rs"
+
+[lib]
+name = "mlua_typegen"
+path = "src/lib.rs"
+
+[dependencies]
+heck = "0.5.0"
