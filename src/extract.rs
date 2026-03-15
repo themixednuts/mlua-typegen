@@ -575,6 +575,17 @@ fn extract_class<'tcx>(
 
     let doc = extract_type_doc(tcx, self_ty);
 
+    // Builder pattern fix: add_function/add_function_mut methods that take
+    // AnyUserData as first param and return AnyUserData (→ any) are actually
+    // returning Self for method chaining. Replace `any` return with the class.
+    for method in &mut methods {
+        if method.kind == MethodKind::Function
+            && method.returns == [LuaType::Any]
+        {
+            method.returns = vec![LuaType::Class(class_name.clone())];
+        }
+    }
+
     Some(LuaClass {
         name: class_name,
         doc,
