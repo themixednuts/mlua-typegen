@@ -259,6 +259,39 @@ pub fn map_rust_type(rust_type: &str, type_args: &[LuaType]) -> LuaType {
         | "chrono::DateTime" => LuaType::String,
         "chrono::Duration" | "std::time::Duration" | "core::time::Duration" => LuaType::Number,
 
+        // rustc-hash (FxHashMap/FxHashSet)
+        "rustc_hash::FxHashMap" | "rustc_hash::map::FxHashMap"
+        | "fxhash::FxHashMap" => {
+            let k = type_args.first().cloned().unwrap_or(LuaType::Any);
+            let v = type_args.get(1).cloned().unwrap_or(LuaType::Any);
+            LuaType::Map(Box::new(k), Box::new(v))
+        }
+        "rustc_hash::FxHashSet" | "rustc_hash::set::FxHashSet"
+        | "fxhash::FxHashSet" => {
+            let inner = type_args.first().cloned().unwrap_or(LuaType::Any);
+            LuaType::Array(Box::new(inner))
+        }
+
+        // arc-swap — ArcSwap<T>, ArcSwapOption<T>, Guard<T>, etc. → unwrap to T
+        "arc_swap::ArcSwap" | "arc_swap::ArcSwapOption"
+        | "arc_swap::ArcSwapAny"
+        | "arc_swap::Guard" | "arc_swap::access::Guard" => {
+            type_args.first().cloned().unwrap_or(LuaType::Any)
+        }
+
+        // left-right — ReadHandle<T> and WriteHandle<T> → unwrap to T
+        "left_right::ReadHandle" | "left_right::WriteHandle"
+        | "left_right::ReadGuard" => {
+            type_args.first().cloned().unwrap_or(LuaType::Any)
+        }
+
+        // evmap (built on left-right) — ReadHandle<K,V> / WriteHandle<K,V> → table<K, V>
+        "evmap::ReadHandle" | "evmap::WriteHandle" => {
+            let k = type_args.first().cloned().unwrap_or(LuaType::Any);
+            let v = type_args.get(1).cloned().unwrap_or(LuaType::Any);
+            LuaType::Map(Box::new(k), Box::new(v))
+        }
+
         // anyhow/eyre error types — unwrap like Result
         "anyhow::Error" | "eyre::Report" | "eyre::EyreReport" => LuaType::Any,
 
@@ -1173,5 +1206,66 @@ mod tests {
             map_rust_type("game::Entity", &[]),
             LuaType::Class("Entity".to_string())
         );
+    }
+
+    // ── FxHashMap / FxHashSet ───────────────────────────────────────────
+
+    #[test]
+    fn fxhashmap_maps_to_map() {
+        for ty in ["rustc_hash::FxHashMap", "fxhash::FxHashMap"] {
+            assert_eq!(
+                map_rust_type(ty, &[LuaType::String, LuaType::Integer]),
+                LuaType::Map(Box::new(LuaType::String), Box::new(LuaType::Integer)),
+                "failed for {ty}"
+            );
+        }
+    }
+
+    #[test]
+    fn fxhashset_maps_to_array() {
+        for ty in ["rustc_hash::FxHashSet", "fxhash::FxHashSet"] {
+            assert_eq!(
+                map_rust_type(ty, &[LuaType::String]),
+                LuaType::Array(Box::new(LuaType::String)),
+                "failed for {ty}"
+            );
+        }
+    }
+
+    // ── arc-swap ────────────────────────────────────────────────────────
+
+    #[test]
+    fn arc_swap_unwraps() {
+        for ty in ["arc_swap::ArcSwap", "arc_swap::ArcSwapOption", "arc_swap::Guard"] {
+            assert_eq!(
+                map_rust_type(ty, &[LuaType::String]),
+                LuaType::String,
+                "failed for {ty}"
+            );
+        }
+    }
+
+    // ── left-right ──────────────────────────────────────────────────────
+
+    #[test]
+    fn left_right_unwraps() {
+        for ty in ["left_right::ReadHandle", "left_right::WriteHandle", "left_right::ReadGuard"] {
+            assert_eq!(
+                map_rust_type(ty, &[LuaType::Table]),
+                LuaType::Table,
+                "failed for {ty}"
+            );
+        }
+    }
+
+    #[test]
+    fn evmap_maps_to_map() {
+        for ty in ["evmap::ReadHandle", "evmap::WriteHandle"] {
+            assert_eq!(
+                map_rust_type(ty, &[LuaType::String, LuaType::Integer]),
+                LuaType::Map(Box::new(LuaType::String), Box::new(LuaType::Integer)),
+                "failed for {ty}"
+            );
+        }
     }
 }

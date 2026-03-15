@@ -1,6 +1,8 @@
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::time::SystemTime;
 
 fn main() -> ExitCode {
     let mut output_dir = PathBuf::from("lua-types");
@@ -35,14 +37,23 @@ fn main() -> ExitCode {
         }
     }
 
+    // If the output directory is missing, invalidate cargo's freshness check so
+    // the driver re-runs. Without this, cargo replays cached diagnostics but
+    // doesn't re-invoke the workspace wrapper, so stubs never get regenerated.
+    if !output_dir.exists() {
+        invalidate_source_mtime();
+    }
+
     // Find the driver binary (installed alongside this binary)
     let driver = find_driver();
 
-    // Run cargo check with our driver as RUSTC_WRAPPER
+    // Run cargo check with our driver as the workspace wrapper.
+    // RUSTC_WORKSPACE_WRAPPER only wraps workspace crates (not deps) and gets
+    // its own artifact cache, so a prior `cargo check` won't suppress our analysis.
     let mut cmd = Command::new("cargo");
     cmd.arg("check")
         .args(&cargo_args)
-        .env("RUSTC_WRAPPER", &driver)
+        .env("RUSTC_WORKSPACE_WRAPPER", &driver)
         .env("MLUA_TYPEGEN_OUTPUT", output_dir.to_string_lossy().as_ref());
 
     // Ensure the toolchain's shared libraries (rustc_driver, std) are findable.
@@ -117,6 +128,21 @@ fn find_sysroot_lib_dir() -> Option<PathBuf> {
     }
 
     None
+}
+
+/// Touch a source file's mtime to force cargo to re-check the workspace crate.
+/// This is metadata-only — file content is unchanged, so git status stays clean.
+fn invalidate_source_mtime() {
+    // Try common entry points in order of likelihood
+    for name in ["src/lib.rs", "src/main.rs"] {
+        let path = Path::new(name);
+        if path.exists() {
+            if let Ok(file) = fs::File::options().write(true).open(path) {
+                let _ = file.set_times(fs::FileTimes::new().set_modified(SystemTime::now()));
+                return;
+            }
+        }
+    }
 }
 
 /// Prepend a directory to the platform's library search path.
