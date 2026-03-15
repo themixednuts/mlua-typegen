@@ -334,18 +334,19 @@ fn params_to_str(params: &[crate::LuaParam]) -> String {
         .join(", ")
 }
 
-/// Writes stub files to the output directory.
-pub fn write_stubs(output_dir: &Path, api: &LuaApi) -> std::io::Result<()> {
-    write_stubs_for(output_dir, api, CodegenTarget::default())
+/// Writes stub files to the output directory with default settings.
+pub fn write_stubs(output_dir: &Path, api: &LuaApi, crate_name: &str) -> std::io::Result<()> {
+    write_stubs_for(output_dir, api, CodegenTarget::default(), crate_name)
 }
 
 /// Writes stub files to the output directory for a specific language server target.
-pub fn write_stubs_for(output_dir: &Path, api: &LuaApi, target: CodegenTarget) -> std::io::Result<()> {
+/// Each crate gets its own file (`<crate_name>.lua`) so workspace builds don't overwrite.
+pub fn write_stubs_for(output_dir: &Path, api: &LuaApi, target: CodegenTarget, crate_name: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(output_dir)?;
 
     let content = generate_stubs_for(api, target);
-    let path = output_dir.join("types.lua");
-    std::fs::write(path, content)?;
+    let filename = format!("{crate_name}.lua");
+    std::fs::write(output_dir.join(filename), content)?;
 
     Ok(())
 }
