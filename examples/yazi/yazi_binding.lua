@@ -10,7 +10,7 @@
 local Bar = {}
 
 ---@param area any?
----@return Bar
+---@return any
 function Bar.area(area) end
 
 ---@param style Style
@@ -29,7 +29,7 @@ function Bar.symbol(symbol) end
 local Border = {}
 
 ---@param area any?
----@return Border
+---@return any
 function Border.area(area) end
 
 ---@param style Style
@@ -53,7 +53,7 @@ function Border.edge(edge) end
 local Clear = {}
 
 ---@param area any?
----@return Clear
+---@return any
 function Clear.area(area) end
 
 ---@class Constraint
@@ -63,7 +63,7 @@ local Constraint = {}
 local Gauge = {}
 
 ---@param area any?
----@return Gauge
+---@return any
 function Gauge.area(area) end
 
 ---@param style Style
@@ -117,7 +117,7 @@ function Layout:split(value) end
 local Line = {}
 
 ---@param area any?
----@return Line
+---@return any
 function Line.area(area) end
 
 ---@param style Style
@@ -125,11 +125,11 @@ function Line.area(area) end
 function Line.style(style) end
 
 ---@param value any
----@return Line
+---@return any
 function Line.fg(value) end
 
 ---@param value any
----@return Line
+---@return any
 function Line.bg(value) end
 
 ---@param remove boolean
@@ -168,9 +168,8 @@ function Line.hidden(remove) end
 ---@return Line
 function Line.crossed(remove) end
 
----@param ud any
 ---@return Line
-function Line.reset(ud) end
+function Line.reset() end
 
 ---@return integer
 function Line:width() end
@@ -190,7 +189,7 @@ function Line.truncate(t) end
 local List = {}
 
 ---@param area any?
----@return List
+---@return any
 function List.area(area) end
 
 ---@class Pad
@@ -258,11 +257,11 @@ local Span = {}
 function Span.style(style) end
 
 ---@param value any
----@return Span
+---@return any
 function Span.fg(value) end
 
 ---@param value any
----@return Span
+---@return any
 function Span.bg(value) end
 
 ---@param remove boolean
@@ -301,9 +300,8 @@ function Span.hidden(remove) end
 ---@return Span
 function Span.crossed(remove) end
 
----@param ud any
 ---@return Span
-function Span.reset(ud) end
+function Span.reset() end
 
 ---@return boolean
 function Span:visible() end
@@ -316,7 +314,7 @@ function Span.truncate(t) end
 local Table = {}
 
 ---@param area any?
----@return Table
+---@return any
 function Table.area(area) end
 
 ---@param header Row
@@ -363,7 +361,7 @@ function Table.cell_style(style) end
 local Text = {}
 
 ---@param area any?
----@return Text
+---@return any
 function Text.area(area) end
 
 ---@param style Style
@@ -371,11 +369,11 @@ function Text.area(area) end
 function Text.style(style) end
 
 ---@param value any
----@return Text
+---@return any
 function Text.fg(value) end
 
 ---@param value any
----@return Text
+---@return any
 function Text.bg(value) end
 
 ---@param remove boolean
@@ -414,9 +412,8 @@ function Text.hidden(remove) end
 ---@return Text
 function Text.crossed(remove) end
 
----@param ud any
 ---@return Text
-function Text.reset(ud) end
+function Text.reset() end
 
 ---@param align Align
 ---@return Text
@@ -452,6 +449,7 @@ function Access.create_new(create_new) end
 ---@async
 ---@param url UserDataRef
 ---@return any
+---@return Error
 function Access:open(url) end
 
 ---@param read boolean
@@ -472,6 +470,7 @@ local SizeCalculator = {}
 
 ---@async
 ---@return any
+---@return Error
 function SizeCalculator:recv() end
 
 ---@class Cha
@@ -502,7 +501,7 @@ local Cha = {}
 ---@return string
 function Cha:hash(long) end
 
----@return any
+---@return Value
 function Cha:perm() end
 
 ---@class MpscTx
@@ -510,7 +509,8 @@ local MpscTx = {}
 
 ---@async
 ---@param value any
----@return any
+---@return boolean
+---@return Error
 function MpscTx:send(value) end
 
 ---@class MpscRx
@@ -518,13 +518,15 @@ local MpscRx = {}
 
 ---@async
 ---@return any
+---@return boolean
 function MpscRx:recv() end
 
 ---@class MpscUnboundedTx
 local MpscUnboundedTx = {}
 
 ---@param value any
----@return any
+---@return boolean
+---@return Error
 function MpscUnboundedTx:send(value) end
 
 ---@class MpscUnboundedRx
@@ -532,13 +534,15 @@ local MpscUnboundedRx = {}
 
 ---@async
 ---@return any
+---@return boolean
 function MpscUnboundedRx:recv() end
 
 ---@class OneshotTx
 local OneshotTx = {}
 
 ---@param value any
----@return any
+---@return boolean
+---@return Error
 function OneshotTx:send(value) end
 
 ---@class OneshotRx
@@ -546,6 +550,7 @@ local OneshotRx = {}
 
 ---@async
 ---@return any
+---@return Error
 function OneshotRx:recv() end
 
 ---@class ChordCow
@@ -582,26 +587,29 @@ function Error.__concat(lhs, rhs) end
 local Fd = {}
 
 ---@async
----@return any
+---@return boolean
+---@return Error
 function Fd:flush() end
 
 ---@async
 ---@param len integer
 ---@return any
+---@return Error
 function Fd:read(len) end
 
 ---@async
 ---@param src string
----@return any
+---@return boolean
+---@return Error
 function Fd:write_all(src) end
 
 ---@class File
----@field cha any (readonly)
----@field url any (readonly)
----@field link_to any (readonly)
----@field name any (readonly)
----@field path any (readonly)
----@field cache any (readonly)
+---@field cha Cha (readonly)
+---@field url string (readonly)
+---@field link_to Path? (readonly)
+---@field name string? (readonly)
+---@field path Path (readonly)
+---@field cache Path? (readonly)
 local File = {}
 
 ---@return integer
@@ -616,8 +624,8 @@ local Handle = {}
 function Handle:abort() end
 
 ---@class Icon
----@field text any (readonly)
----@field style any (readonly)
+---@field text string (readonly)
+---@field style Style (readonly)
 local Icon = {}
 
 ---@class Id
@@ -658,10 +666,9 @@ local Iter = {}
 ---@return integer
 function Iter:__len() end
 
----@param ud any
 ---@return function
 ---@return any
-function Iter.__pairs(ud) end
+function Iter.__pairs() end
 
 ---@class Layer
 local Layer = {}
@@ -678,10 +685,10 @@ function Layer:__tostring() end
 local MouseEvent = {}
 
 ---@class Path
----@field ext any (readonly)
----@field name any (readonly)
----@field parent any (readonly)
----@field stem any (readonly)
+---@field ext string? (readonly)
+---@field name string? (readonly)
+---@field parent Path? (readonly)
+---@field stem string? (readonly)
 ---@field is_absolute boolean (readonly)
 ---@field has_root boolean (readonly)
 local Path = {}
@@ -720,26 +727,27 @@ local Permit = {}
 function Permit:drop() end
 
 ---@class Scheme
----@field kind any (readonly)
----@field cache any (readonly)
+---@field kind string (readonly)
+---@field cache Path? (readonly)
 ---@field is_virtual boolean (readonly)
 local Scheme = {}
 
 ---@class FolderStage
 local FolderStage = {}
 
----@return any
+---@return boolean
+---@return Error
 function FolderStage:__call() end
 
 ---@class Style
 local Style = {}
 
 ---@param value any
----@return Style
+---@return any
 function Style.fg(value) end
 
 ---@param value any
----@return Style
+---@return any
 function Style.bg(value) end
 
 ---@param remove boolean
@@ -778,11 +786,10 @@ function Style.hidden(remove) end
 ---@return Style
 function Style.crossed(remove) end
 
----@param ud any
 ---@return Style
-function Style.reset(ud) end
+function Style.reset() end
 
----@return any
+---@return Lua
 function Style:raw() end
 
 ---@param style Style
@@ -790,16 +797,16 @@ function Style:raw() end
 function Style.patch(style) end
 
 ---@class Url
----@field path any (readonly)
----@field name any (readonly)
----@field stem any (readonly)
----@field ext any (readonly)
----@field urn any (readonly)
----@field base any (readonly)
----@field parent any (readonly)
----@field scheme any (readonly)
----@field domain any (readonly)
----@field cache any (readonly)
+---@field path Path (readonly)
+---@field name string? (readonly)
+---@field stem string? (readonly)
+---@field ext string? (readonly)
+---@field urn Path (readonly)
+---@field base string? (readonly)
+---@field parent string? (readonly)
+---@field scheme Scheme (readonly)
+---@field domain string? (readonly)
+---@field cache Path? (readonly)
 ---@field is_regular boolean (readonly)
 ---@field is_search boolean (readonly)
 ---@field is_archive boolean (readonly)
@@ -816,7 +823,7 @@ function Url:ends_with(child) end
 function Url:hash(long) end
 
 ---@param other any
----@return any
+---@return string
 function Url:join(other) end
 
 ---@param base any

@@ -4,17 +4,17 @@
 local Core = {}
 
 ---@param key string
----@return any
+---@return Tab | Tabs | Tasks | Yanked | Layer | Which?
 function Core:__index(key) end
 
 ---@class File
----@field cha any (readonly)
----@field url any (readonly)
----@field link_to any (readonly)
----@field name any (readonly)
----@field path any (readonly)
----@field cache any (readonly)
----@field bare any (readonly)
+---@field cha Cha (readonly)
+---@field url Url (readonly)
+---@field link_to Path? (readonly)
+---@field name string? (readonly)
+---@field path Path (readonly)
+---@field cache Path? (readonly)
+---@field bare File (readonly)
 ---@field idx integer (readonly)
 ---@field is_hovered boolean (readonly)
 ---@field in_current boolean (readonly)
@@ -55,14 +55,14 @@ function File:found() end
 function File:highlights() end
 
 ---@class Files
----@field filter any (readonly)
+---@field filter Filter (readonly)
 local Files = {}
 
 ---@return integer
 function Files:__len() end
 
 ---@param idx integer
----@return any?
+---@return File
 function Files:__index(idx) end
 
 ---@class Filter
@@ -78,13 +78,13 @@ local Finder = {}
 function Finder:__tostring() end
 
 ---@class Folder
----@field cwd any (readonly)
----@field files any (readonly)
----@field stage any (readonly)
----@field window any (readonly)
+---@field cwd Url (readonly)
+---@field files Files (readonly)
+---@field stage FolderStage (readonly)
+---@field window Files (readonly)
 ---@field offset integer (readonly)
 ---@field cursor integer (readonly)
----@field hovered any (readonly)
+---@field hovered File (readonly)
 local Folder = {}
 
 ---@class Mode
@@ -97,10 +97,10 @@ local Mode = {}
 function Mode:__tostring() end
 
 ---@class Preference
----@field name any (readonly)
----@field linemode any (readonly)
+---@field name string (readonly)
+---@field linemode string (readonly)
 ---@field show_hidden boolean (readonly)
----@field sort_by any (readonly)
+---@field sort_by string (readonly)
 ---@field sort_sensitive boolean (readonly)
 ---@field sort_reverse boolean (readonly)
 ---@field sort_dir_first boolean (readonly)
@@ -110,23 +110,23 @@ local Preference = {}
 
 ---@class Preview
 ---@field skip integer (readonly)
----@field folder any (readonly)
+---@field folder Folder (readonly)
 local Preview = {}
 
 ---@class Tab
 ---@field id Id (readonly)
----@field name any (readonly)
----@field mode any (readonly)
----@field pref any (readonly)
----@field current any (readonly)
----@field parent any (readonly)
----@field selected any (readonly)
----@field preview any (readonly)
----@field finder any (readonly)
+---@field name string (readonly)
+---@field mode Mode (readonly)
+---@field pref Preference (readonly)
+---@field current Folder (readonly)
+---@field parent Folder (readonly)
+---@field selected Selected (readonly)
+---@field preview Preview (readonly)
+---@field finder Finder (readonly)
 local Tab = {}
 
 ---@param url UserDataRef
----@return any?
+---@return Folder?
 function Tab:history(url) end
 
 ---@class Tabs
@@ -137,11 +137,11 @@ local Tabs = {}
 function Tabs:__len() end
 
 ---@param idx integer
----@return any?
+---@return Tab
 function Tabs:__index(idx) end
 
 ---@class TaskSnap
----@field name any (readonly)
+---@field name string (readonly)
 ---@field prog any (readonly)
 ---@field cooked boolean (readonly)
 ---@field running boolean (readonly)
@@ -152,14 +152,14 @@ local TaskSnap = {}
 
 ---@class Tasks
 ---@field cursor integer (readonly)
----@field snaps any (readonly)
+---@field snaps table (readonly)
 ---@field summary any (readonly)
 local Tasks = {}
 
 ---@class Which
----@field tx any (readonly)
+---@field tx MpscUnboundedTx? (readonly)
 ---@field times integer (readonly)
----@field cands any (readonly)
+---@field cands table (readonly)
 ---@field active boolean (readonly)
 ---@field silent boolean (readonly)
 local Which = {}
@@ -171,5 +171,5 @@ local Yanked = {}
 ---@return integer
 function Yanked:__len() end
 
----@return any
+---@return table
 function Yanked:__pairs() end

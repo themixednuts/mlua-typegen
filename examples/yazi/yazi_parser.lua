@@ -7,5 +7,5 @@ local UpdateYankedIter = {}
 ---@return integer
 function UpdateYankedIter:__len() end
 
----@return any
+---@return table
 function UpdateYankedIter:__pairs() end

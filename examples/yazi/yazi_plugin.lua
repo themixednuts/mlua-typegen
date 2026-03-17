@@ -15,53 +15,59 @@ function Child:id() end
 function Child:read(len) end
 
 ---@async
----@return any
+---@return string
+---@return integer
 function Child:read_line() end
 
 ---@async
 ---@param options table
----@return any
+---@return string
+---@return integer
 function Child:read_line_with(options) end
 
 ---@async
 ---@param src string
----@return any
+---@return boolean
+---@return Error
 function Child:write_all(src) end
 
 ---@async
----@return any
+---@return boolean
+---@return Error
 function Child:flush() end
 
 ---@async
 ---@return any
+---@return Error
 function Child:wait() end
 
 ---@async
----@param ud any
----@return Child
-function Child.wait_with_output(ud) end
+---@return any
+function Child.wait_with_output() end
 
 ---@async
 ---@return any
+---@return Error
 function Child:try_wait() end
 
----@return any
+---@return boolean
+---@return Error
 function Child:start_kill() end
 
----@return any
+---@return ChildStdin?
 function Child:take_stdin() end
 
----@return any
+---@return ChildStdout?
 function Child:take_stdout() end
 
----@return any
+---@return ChildStderr?
 function Child:take_stderr() end
 
 ---@class Command
 local Command = {}
 
 ---@param arg any
----@return Command
+---@return any
 function Command.arg(arg) end
 
 ---@param dir string
@@ -90,20 +96,23 @@ function Command.stderr(stdio) end
 function Command.memory(max) end
 
 ---@return any
+---@return Error
 function Command:spawn() end
 
 ---@async
 ---@return any
+---@return Error
 function Command:output() end
 
 ---@async
 ---@return any
+---@return Error
 function Command:status() end
 
 ---@class Output
----@field status any (readonly)
----@field stdout any (readonly)
----@field stderr any (readonly)
+---@field status Status (readonly)
+---@field stdout string (readonly)
+---@field stderr string (readonly)
 local Output = {}
 
 ---@class Status
@@ -112,17 +121,17 @@ local Output = {}
 local Status = {}
 
 ---@class Fetcher
----@field cmd any (readonly)
+---@field cmd string (readonly)
 local Fetcher = {}
 
 ---@class Spotter
----@field cmd any (readonly)
+---@field cmd string (readonly)
 local Spotter = {}
 
 ---@class Preloader
----@field cmd any (readonly)
+---@field cmd string (readonly)
 local Preloader = {}
 
 ---@class Previewer
----@field cmd any (readonly)
+---@field cmd string (readonly)
 local Previewer = {}
