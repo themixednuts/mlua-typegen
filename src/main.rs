@@ -9,14 +9,8 @@ fn main() -> ExitCode {
     let mut emmylua = false;
     let mut cargo_args = Vec::new();
 
-    // Skip "mlua-typegen" if invoked as `cargo mlua-typegen`
     let args: Vec<String> = env::args().skip(1).collect();
     let mut args_iter = args.iter().peekable();
-
-    // Skip the subcommand name if cargo passes it
-    if args_iter.peek().is_some_and(|a| a.as_str() == "mlua-typegen") {
-        args_iter.next();
-    }
 
     while let Some(arg) = args_iter.next() {
         match arg.as_str() {
@@ -50,11 +44,17 @@ fn main() -> ExitCode {
     // Run cargo check with our driver as the workspace wrapper.
     // RUSTC_WORKSPACE_WRAPPER only wraps workspace crates (not deps) and gets
     // its own artifact cache, so a prior `cargo check` won't suppress our analysis.
+    // The driver links against nightly rustc internals, so we force the nightly
+    // toolchain via RUSTUP_TOOLCHAIN (unless the user already set it).
     let mut cmd = Command::new("cargo");
     cmd.arg("check")
         .args(&cargo_args)
         .env("RUSTC_WORKSPACE_WRAPPER", &driver)
         .env("MLUA_TYPEGEN_OUTPUT", output_dir.to_string_lossy().as_ref());
+
+    if env::var("RUSTUP_TOOLCHAIN").is_err() {
+        cmd.env("RUSTUP_TOOLCHAIN", "nightly");
+    }
 
     // Ensure the toolchain's shared libraries (rustc_driver, std) are findable.
     // The driver links against these DLLs and needs them on the library search path.
@@ -101,10 +101,9 @@ fn find_driver() -> PathBuf {
 /// Find the directory containing rustc_driver shared libraries.
 /// This is typically `<sysroot>/bin` on Windows or `<sysroot>/lib` on Unix.
 fn find_sysroot_lib_dir() -> Option<PathBuf> {
-    // Ask rustc for its sysroot
-    let output = Command::new("rustc")
-        .arg("--print")
-        .arg("sysroot")
+    // Ask nightly rustc for its sysroot (the driver links against nightly libs)
+    let output = Command::new("rustup")
+        .args(["run", "nightly", "rustc", "--print", "sysroot"])
         .output()
         .ok()?;
 

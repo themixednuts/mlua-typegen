@@ -6,7 +6,7 @@ description = "Extract Lua type stubs from mlua UserData impls using rustc's typ
 license = "MIT"
 
 [[bin]]
-name = "cargo-mlua-typegen"
+name = "mlua-typegen"
 path = "src/main.rs"
 
 [[bin]]
