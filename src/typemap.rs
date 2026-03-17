@@ -192,6 +192,10 @@ pub fn map_rust_type(rust_type: &str, type_args: &[LuaType]) -> LuaType {
         "mlua::multi::MultiValue" | "mlua::MultiValue"
         | "mlua::prelude::LuaMultiValue" => LuaType::Any,
 
+        // mlua::Error → string (Lua errors are strings)
+        "mlua::error::Error" | "mlua::Error"
+        | "mlua::prelude::LuaError" => LuaType::String,
+
         // Variadic<T> → T...
         "mlua::types::Variadic" | "mlua::Variadic"
         | "mlua::prelude::LuaVariadic" => {
