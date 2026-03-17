@@ -6,8 +6,8 @@ use rustc_span::Symbol;
 
 use heck::ToSnakeCase;
 use mlua_typegen::{
-    LuaApi, LuaClass, LuaEnum, LuaField, LuaFunction, LuaMethod, LuaModule, LuaParam, LuaType,
-    MethodKind, make_union,
+    LuaApi, LuaClass, LuaEnum, LuaField, LuaFunction, LuaMethod, LuaModule, LuaParam, LuaReturn,
+    LuaType, MethodKind, make_union,
 };
 use mlua_typegen::typemap::map_rust_type;
 
@@ -537,7 +537,7 @@ fn unwrap_try_expr<'tcx>(expr: &'tcx hir::Expr<'tcx>) -> &'tcx hir::Expr<'tcx> {
 fn extract_standalone_closure_signature(
     tcx: TyCtxt<'_>,
     closure_expr: &hir::Expr<'_>,
-) -> Option<(Vec<LuaParam>, Vec<LuaType>)> {
+) -> Option<(Vec<LuaParam>, Vec<LuaReturn>)> {
     let hir::ExprKind::Closure(closure) = &closure_expr.kind else {
         return None;
     };
@@ -571,14 +571,17 @@ fn extract_standalone_closure_signature(
     let mut returns = map_return_ty(tcx, ret_ty);
 
     // When the signature returns Any (Value) or MultiValue, try to infer concrete types from body
-    if returns.len() == 1 && !is_informative(&returns[0]) {
-        let body = tcx.hir_body(closure.body);
+    let body = tcx.hir_body(closure.body);
+    if returns.len() == 1 && !is_informative(&returns[0].ty) {
         if let Some(inferred) = infer_multi_returns_from_body(tcx, body.value) {
-            if inferred.iter().any(|t| is_informative(t)) {
+            if inferred.iter().any(|r| is_informative(&r.ty)) {
                 returns = inferred;
             }
         }
     }
+
+    // Enrich multi-returns with names from the body's tuple expression
+    enrich_return_names(tcx, body.value, &mut returns);
 
     Some((params, returns))
 }
@@ -618,8 +621,8 @@ fn extract_class<'tcx>(
     // pattern: add_function taking AnyUserData and returning AnyUserData.
     for method in &mut methods {
         for ret in &mut method.returns {
-            if is_self_return_sentinel(ret) {
-                *ret = LuaType::Class(class_name.clone());
+            if is_self_return_sentinel(&ret.ty) {
+                ret.ty = LuaType::Class(class_name.clone());
             }
         }
     }
@@ -863,7 +866,7 @@ fn extract_closure_signature(
     tcx: TyCtxt<'_>,
     closure_expr: &hir::Expr<'_>,
     kind: MethodKind,
-) -> Option<(Vec<LuaParam>, Vec<LuaType>)> {
+) -> Option<(Vec<LuaParam>, Vec<LuaReturn>)> {
     let hir::ExprKind::Closure(closure) = &closure_expr.kind else {
         return None;
     };
@@ -944,7 +947,7 @@ fn extract_closure_signature(
                 let ret_ty = unwrap_result_ty(tcx, sig.output());
                 let returns = if is_any_user_data(tcx, ret_ty) {
                     // Builder pattern: returns AnyUserData (self) for chaining.
-                    vec![self_return_sentinel()]
+                    vec![self_return_sentinel().into()]
                 } else {
                     map_return_ty(tcx, sig.output())
                 };
@@ -960,14 +963,17 @@ fn extract_closure_signature(
     let mut returns = map_return_ty(tcx, ret_ty);
 
     // When the signature returns Any (Value) or MultiValue, try to infer concrete types from body
-    if returns.len() == 1 && !is_informative(&returns[0]) {
-        let body = tcx.hir_body(closure.body);
+    let body = tcx.hir_body(closure.body);
+    if returns.len() == 1 && !is_informative(&returns[0].ty) {
         if let Some(inferred) = infer_multi_returns_from_body(tcx, body.value) {
-            if inferred.iter().any(|t| is_informative(t)) {
+            if inferred.iter().any(|r| is_informative(&r.ty)) {
                 returns = inferred;
             }
         }
     }
+
+    // Enrich multi-returns with names from the body's tuple expression
+    enrich_return_names(tcx, body.value, &mut returns);
 
     Some((params, returns))
 }
@@ -1265,9 +1271,9 @@ fn map_ty_to_lua<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> LuaType {
     }
 }
 
-/// Map a return type to a list of Lua types.
+/// Map a return type to a list of Lua return values.
 /// Handles Result unwrapping and tuple decomposition for multiple returns.
-fn map_return_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> Vec<LuaType> {
+fn map_return_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> Vec<LuaReturn> {
     // Unwrap Coroutine (async closures) to get the actual return type
     let ty = unwrap_coroutine_ty(tcx, ty);
     // Then unwrap Result<T, _> → T
@@ -1280,7 +1286,7 @@ fn map_return_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> Vec<LuaType> {
         // Non-empty tuple = multiple return values
         ty::TyKind::Tuple(fields) => fields
             .iter()
-            .map(|t| map_ty_to_lua(tcx, t))
+            .map(|t| LuaReturn::from(map_ty_to_lua(tcx, t)))
             .collect(),
 
         // Single return value
@@ -1289,7 +1295,7 @@ fn map_return_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> Vec<LuaType> {
             if lua_ty == LuaType::Nil {
                 Vec::new()
             } else {
-                vec![lua_ty]
+                vec![lua_ty.into()]
             }
         }
     }
@@ -1425,7 +1431,6 @@ fn extract_type_name_from_qpath(qpath: &hir::QPath<'_>) -> Option<String> {
                 None
             }
         }
-        _ => None,
     }
 }
 
@@ -1623,21 +1628,166 @@ fn infer_concrete_type_from_body<'tcx>(
 fn infer_multi_returns_from_body<'tcx>(
     tcx: TyCtxt<'tcx>,
     expr: &'tcx hir::Expr<'tcx>,
-) -> Option<Vec<LuaType>> {
+) -> Option<Vec<LuaReturn>> {
     // Search for .into_lua_multi() on a tuple receiver
     if let Some(returns) = find_into_lua_multi_tuple(tcx, expr) {
         return Some(returns);
     }
     // Fall back to single-type inference
-    infer_concrete_type_from_body(tcx, expr).map(|ty| vec![ty])
+    infer_concrete_type_from_body(tcx, expr).map(|ty| vec![ty.into()])
+}
+
+/// Try to extract return-value names from the body's return tuple expression.
+/// Works on `Ok((a.x, a.y, z))` and bare `(a.x, a.y, z)` patterns.
+/// Enriches existing typed returns with names when the tuple element count matches.
+fn enrich_return_names<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &'tcx hir::Expr<'tcx>,
+    returns: &mut [LuaReturn],
+) {
+    if returns.len() < 2 || returns.iter().any(|r| r.name.is_some()) {
+        return;
+    }
+    if let Some(names) = find_return_tuple_names(tcx, body) {
+        if names.len() == returns.len() {
+            for (ret, name) in returns.iter_mut().zip(names) {
+                ret.name = name;
+            }
+        }
+    }
+}
+
+/// Walk the body to find the return tuple expression and extract element names.
+fn find_return_tuple_names<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+) -> Option<Vec<Option<String>>> {
+    match &expr.kind {
+        // Ok((a, b, c)) — unwrap the Ok() call
+        hir::ExprKind::Call(callee, args) => {
+            if let hir::ExprKind::Path(qpath) = &callee.kind {
+                let name = match qpath {
+                    hir::QPath::Resolved(_, path) => {
+                        path.segments.last().map(|s| s.ident.name.as_str())
+                    }
+                    hir::QPath::TypeRelative(_, seg) => Some(seg.ident.name.as_str()),
+                };
+                if matches!(name, Some("Ok" | "Some")) && args.len() == 1 {
+                    return find_return_tuple_names(tcx, &args[0]);
+                }
+            }
+            None
+        }
+        // (a, b, c) tuple literal
+        hir::ExprKind::Tup(elements) => {
+            Some(elements.iter().map(|e| extract_return_name(e)).collect())
+        }
+        // Block — check tail expression
+        hir::ExprKind::Block(block, _) => {
+            if let Some(tail) = block.expr {
+                return find_return_tuple_names(tcx, tail);
+            }
+            None
+        }
+        // Match (try desugar `?`) — look through
+        hir::ExprKind::Match(scrut, _, hir::MatchSource::TryDesugar(_)) => {
+            find_return_tuple_names(tcx, scrut)
+        }
+        // Regular match — check first arm
+        hir::ExprKind::Match(_, arms, _) => {
+            for arm in *arms {
+                if let Some(names) = find_return_tuple_names(tcx, arm.body) {
+                    return Some(names);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Extract a name from a tuple element expression for return value naming.
+/// Handles field accesses (`self.x` → "x"), variable references (`pos` → "pos"),
+/// and method calls (`self.get_x()` → "x").
+fn extract_return_name(expr: &hir::Expr<'_>) -> Option<String> {
+    match &expr.kind {
+        // self.field or obj.field → "field"
+        hir::ExprKind::Field(_, ident) => {
+            let name = ident.name.as_str();
+            // Skip underscore-prefixed names
+            if name.starts_with('_') { None } else { Some(name.to_string()) }
+        }
+        // Variable reference → use variable name
+        hir::ExprKind::Path(hir::QPath::Resolved(_, path)) => {
+            if let Some(seg) = path.segments.last() {
+                let name = seg.ident.name.as_str();
+                if name.starts_with('_') || name == "self" { None } else { Some(name.to_string()) }
+            } else {
+                None
+            }
+        }
+        // method_call(...)? → unwrap try and recurse
+        hir::ExprKind::Match(scrut, _, hir::MatchSource::TryDesugar(_)) => {
+            extract_return_name(scrut)
+        }
+        // method().into_lua() or similar chains → look at receiver
+        hir::ExprKind::MethodCall(seg, receiver, _, _) => {
+            let method = seg.ident.name.as_str();
+            // Skip conversion methods, look through to receiver
+            if matches!(method, "into_lua" | "into_lua_multi" | "clone" | "to_owned"
+                | "to_string" | "into" | "as_ref" | "borrow") {
+                return extract_return_name(receiver);
+            }
+            // get_x() → "x", x() → "x"
+            let name = method.strip_prefix("get_").unwrap_or(method);
+            if name.starts_with('_') { None } else { Some(name.to_string()) }
+        }
+        // Function call: look at callee for associated function name
+        hir::ExprKind::Call(callee, _) => {
+            if let hir::ExprKind::Path(qpath) = &callee.kind {
+                match qpath {
+                    hir::QPath::TypeRelative(_, seg) => {
+                        let name = seg.ident.name.as_str();
+                        if name == "new" || name.starts_with('_') { None } else { Some(name.to_string()) }
+                    }
+                    hir::QPath::Resolved(_, path) => {
+                        path.segments.last().map(|s| s.ident.name.as_str().to_string())
+                    }
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Extract names from a tuple expression's elements.
+fn extract_tuple_element_names<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    receiver: &'tcx hir::Expr<'tcx>,
+) -> Vec<Option<String>> {
+    match &receiver.kind {
+        hir::ExprKind::Tup(elements) => {
+            elements.iter().map(|e| extract_return_name(e)).collect()
+        }
+        // Look through blocks to find the tuple
+        hir::ExprKind::Block(block, _) => {
+            if let Some(tail) = block.expr {
+                return extract_tuple_element_names(tcx, tail);
+            }
+            Vec::new()
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// Search an expression tree for `.into_lua_multi()` calls on tuple receivers.
-/// Returns the decomposed tuple elements as multiple Lua types.
+/// Returns the decomposed tuple elements as multiple Lua return values with names.
 fn find_into_lua_multi_tuple<'tcx>(
     tcx: TyCtxt<'tcx>,
     expr: &'tcx hir::Expr<'tcx>,
-) -> Option<Vec<LuaType>> {
+) -> Option<Vec<LuaReturn>> {
     match &expr.kind {
         hir::ExprKind::MethodCall(segment, receiver, _, _) => {
             if segment.ident.name.as_str() == "into_lua_multi" {
@@ -1645,9 +1795,15 @@ fn find_into_lua_multi_tuple<'tcx>(
                 let receiver_ty = typeck.expr_ty(receiver);
                 if let ty::TyKind::Tuple(fields) = receiver_ty.kind() {
                     if !fields.is_empty() {
-                        let returns: Vec<LuaType> = fields
+                        let names = extract_tuple_element_names(tcx, receiver);
+                        let returns: Vec<LuaReturn> = fields
                             .iter()
-                            .map(|t| map_ty_to_lua(tcx, t))
+                            .enumerate()
+                            .map(|(i, t)| {
+                                let ty = map_ty_to_lua(tcx, t);
+                                let name = names.get(i).and_then(|n| n.clone());
+                                LuaReturn { ty, name }
+                            })
                             .collect();
                         return Some(returns);
                     }

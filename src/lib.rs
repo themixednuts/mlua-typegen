@@ -121,6 +121,25 @@ pub struct LuaParam {
     pub ty: LuaType,
 }
 
+/// A return value from a Lua method/function.
+#[derive(Debug, Clone)]
+pub struct LuaReturn {
+    pub ty: LuaType,
+    pub name: Option<String>,
+}
+
+impl From<LuaType> for LuaReturn {
+    fn from(ty: LuaType) -> Self {
+        Self { ty, name: None }
+    }
+}
+
+impl LuaReturn {
+    pub fn named(ty: LuaType, name: impl Into<String>) -> Self {
+        Self { ty, name: Some(name.into()) }
+    }
+}
+
 /// Whether a method takes `self` or is static.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MethodKind {
@@ -136,7 +155,7 @@ pub struct LuaMethod {
     pub is_async: bool,
     pub params: Vec<LuaParam>,
     /// Multiple return values (empty = void/nil).
-    pub returns: Vec<LuaType>,
+    pub returns: Vec<LuaReturn>,
     pub doc: Option<String>,
 }
 
@@ -174,7 +193,7 @@ pub struct LuaFunction {
     pub is_async: bool,
     pub params: Vec<LuaParam>,
     /// Multiple return values (empty = void/nil).
-    pub returns: Vec<LuaType>,
+    pub returns: Vec<LuaReturn>,
     pub doc: Option<String>,
 }
 

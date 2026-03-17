@@ -15,30 +15,30 @@ function Child:id() end
 function Child:read(len) end
 
 ---@async
----@return string
----@return integer
+---@return string branch
+---@return integer event
 function Child:read_line() end
 
 ---@async
 ---@param options table
----@return string
----@return integer
+---@return string branch
+---@return integer event
 function Child:read_line_with(options) end
 
 ---@async
 ---@param src string
 ---@return boolean
----@return Error
+---@return Error Io
 function Child:write_all(src) end
 
 ---@async
 ---@return boolean
----@return Error
+---@return Error Io
 function Child:flush() end
 
 ---@async
----@return any
----@return Error
+---@return any Nil
+---@return Error Io
 function Child:wait() end
 
 ---@async
@@ -46,12 +46,12 @@ function Child:wait() end
 function Child.wait_with_output() end
 
 ---@async
----@return any
----@return Error
+---@return any Nil
+---@return Error Io
 function Child:try_wait() end
 
 ---@return boolean
----@return Error
+---@return Error Io
 function Child:start_kill() end
 
 ---@return ChildStdin?
@@ -95,18 +95,18 @@ function Command.stderr(stdio) end
 ---@return Command
 function Command.memory(max) end
 
----@return any
----@return Error
+---@return any Nil
+---@return Error Io
 function Command:spawn() end
 
 ---@async
----@return any
----@return Error
+---@return any Nil
+---@return Error Io
 function Command:output() end
 
 ---@async
----@return any
----@return Error
+---@return any Nil
+---@return Error Io
 function Command:status() end
 
 ---@class Output

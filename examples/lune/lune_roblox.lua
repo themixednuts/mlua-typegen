@@ -91,18 +91,18 @@ function CFrame:VectorToWorldSpace(...) end
 ---@return Vector3...
 function CFrame:VectorToObjectSpace(...) end
 
----@return number
----@return number
----@return number
----@return number
----@return number
----@return number
----@return number
----@return number
----@return number
----@return number
----@return number
----@return number
+---@return number x
+---@return number y
+---@return number z
+---@return number x
+---@return number y
+---@return number z
+---@return number x
+---@return number y
+---@return number z
+---@return number x
+---@return number y
+---@return number z
 function CFrame:GetComponents() end
 
 ---@return number
@@ -110,18 +110,18 @@ function CFrame:GetComponents() end
 ---@return number
 function CFrame:ToEulerAnglesXYZ() end
 
----@return number
----@return number
----@return number
+---@return number rx
+---@return number ry
+---@return number rz
 function CFrame:ToEulerAnglesYXZ() end
 
----@return number
----@return number
----@return number
+---@return number rx
+---@return number ry
+---@return number rz
 function CFrame:ToOrientation() end
 
----@return Vector3
----@return number
+---@return Vector3 Vector3
+---@return number angle
 function CFrame:ToAxisAngle() end
 
 ---@param rhs any
@@ -154,9 +154,9 @@ local Color3 = {}
 ---@return Color3
 function Color3:Lerp(rhs, alpha) end
 
----@return number
----@return number
----@return number
+---@return number hue
+---@return number sat
+---@return number max
 function Color3:ToHSV() end
 
 ---@return string

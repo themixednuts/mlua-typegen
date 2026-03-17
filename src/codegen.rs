@@ -162,7 +162,7 @@ fn write_overloaded_method(
         let ret_sig = if method.returns.is_empty() {
             String::new()
         } else {
-            let rets = method.returns.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(", ");
+            let rets = method.returns.iter().map(|r| r.ty.to_string()).collect::<Vec<_>>().join(", ");
             format!(": {rets}")
         };
 
@@ -262,7 +262,7 @@ fn write_overloaded_function(
         let ret_sig = if func.returns.is_empty() {
             String::new()
         } else {
-            let rets = func.returns.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(", ");
+            let rets = func.returns.iter().map(|r| r.ty.to_string()).collect::<Vec<_>>().join(", ");
             format!(": {rets}")
         };
 
@@ -313,9 +313,13 @@ fn write_params(out: &mut String, params: &[crate::LuaParam]) {
 }
 
 /// Write `---@return` annotations for multiple return values.
-fn write_returns(out: &mut String, returns: &[LuaType]) {
+fn write_returns(out: &mut String, returns: &[crate::LuaReturn]) {
     for ret in returns {
-        writeln!(out, "---@return {ret}").unwrap();
+        if let Some(name) = &ret.name {
+            writeln!(out, "---@return {} {name}", ret.ty).unwrap();
+        } else {
+            writeln!(out, "---@return {}", ret.ty).unwrap();
+        }
     }
 }
 
@@ -509,7 +513,7 @@ mod tests {
         assert_eq!(
             LuaType::FunctionSig {
                 params: vec![LuaType::Integer, LuaType::String],
-                returns: vec![LuaType::Boolean],
+                returns: vec![LuaType::Boolean.into()],
             }
             .to_string(),
             "fun(p1: integer, p2: string): boolean"
@@ -521,7 +525,7 @@ mod tests {
         assert_eq!(
             LuaType::FunctionSig {
                 params: vec![LuaType::Any],
-                returns: vec![LuaType::String, LuaType::Integer],
+                returns: vec![LuaType::String.into(), LuaType::Integer.into()],
             }
             .to_string(),
             "fun(p1: any): string, integer"
@@ -560,7 +564,7 @@ mod tests {
                         kind: MethodKind::Method,
                         is_async: false,
                         params: vec![],
-                        returns: vec![LuaType::String],
+                        returns: vec![LuaType::String.into()],
                         doc: None,
                     },
                     LuaMethod {
@@ -577,7 +581,7 @@ mod tests {
                                 ty: LuaType::Class("Position".to_string()),
                             },
                         ],
-                        returns: vec![LuaType::String],
+                        returns: vec![LuaType::String.into()],
                         doc: None,
                     },
                     LuaMethod {
@@ -587,7 +591,7 @@ mod tests {
                         params: vec![],
                         returns: vec![LuaType::Array(Box::new(LuaType::Class(
                             "Diagnostic".to_string(),
-                        )))],
+                        ))).into()],
                         doc: None,
                     },
                     LuaMethod {
@@ -598,7 +602,7 @@ mod tests {
                             name: "path".to_string(),
                             ty: LuaType::String,
                         }],
-                        returns: vec![LuaType::Class("Buffer".to_string())],
+                        returns: vec![LuaType::Class("Buffer".to_string()).into()],
                         doc: None,
                     },
                 ],
@@ -727,7 +731,7 @@ function Buffer.create(path) end
                             name: "path".to_string(),
                             ty: LuaType::String,
                         }],
-                        returns: vec![LuaType::String],
+                        returns: vec![LuaType::String.into()],
                         doc: None,
                     },
                     LuaFunction {
@@ -737,7 +741,7 @@ function Buffer.create(path) end
                             name: "path".to_string(),
                             ty: LuaType::String,
                         }],
-                        returns: vec![LuaType::Boolean],
+                        returns: vec![LuaType::Boolean.into()],
                         doc: None,
                     },
                 ],
@@ -850,7 +854,7 @@ function print_colored(msg, color) end
                         name: "url".to_string(),
                         ty: LuaType::String,
                     }],
-                    returns: vec![LuaType::String],
+                    returns: vec![LuaType::String.into()],
                     doc: None,
                 }],
             }],
@@ -894,7 +898,7 @@ function print_colored(msg, color) end
                         name: "url".to_string(),
                         ty: LuaType::String,
                     }],
-                    returns: vec![LuaType::Table],
+                    returns: vec![LuaType::Table.into()],
                     doc: None,
                 }],
             }],
@@ -921,7 +925,7 @@ function print_colored(msg, color) end
                         name: "input".to_string(),
                         ty: LuaType::String,
                     }],
-                    returns: vec![LuaType::Boolean, LuaType::String],
+                    returns: vec![LuaType::Boolean.into(), LuaType::String.into()],
                     doc: None,
                 }],
             }],
@@ -939,7 +943,7 @@ function print_colored(msg, color) end
                 name: "get_rgb".to_string(),
                 is_async: false,
                 params: vec![],
-                returns: vec![LuaType::Integer, LuaType::Integer, LuaType::Integer],
+                returns: vec![LuaType::Integer.into(), LuaType::Integer.into(), LuaType::Integer.into()],
                 doc: None,
             }],
             ..Default::default()
@@ -1004,7 +1008,7 @@ function print_colored(msg, color) end
                     name: "numbers".to_string(),
                     ty: LuaType::Variadic(Box::new(LuaType::Number)),
                 }],
-                returns: vec![LuaType::Number],
+                returns: vec![LuaType::Number.into()],
                 doc: None,
             }],
             ..Default::default()
@@ -1025,7 +1029,7 @@ function print_colored(msg, color) end
                     name: "key".to_string(),
                     ty: LuaType::String,
                 }],
-                returns: vec![LuaType::Optional(Box::new(LuaType::String))],
+                returns: vec![LuaType::Optional(Box::new(LuaType::String)).into()],
                 doc: None,
             }],
             ..Default::default()
@@ -1044,7 +1048,7 @@ function print_colored(msg, color) end
                     name: "data".to_string(),
                     ty: LuaType::Map(Box::new(LuaType::String), Box::new(LuaType::Any)),
                 }],
-                returns: vec![LuaType::Table],
+                returns: vec![LuaType::Table.into()],
                 doc: None,
             }],
             ..Default::default()
@@ -1060,7 +1064,7 @@ function print_colored(msg, color) end
                 name: "get_items".to_string(),
                 is_async: false,
                 params: vec![],
-                returns: vec![LuaType::Array(Box::new(LuaType::Class("Item".to_string())))],
+                returns: vec![LuaType::Array(Box::new(LuaType::Class("Item".to_string()))).into()],
                 doc: None,
             }],
             ..Default::default()
@@ -1079,7 +1083,7 @@ function print_colored(msg, color) end
                     name: "func".to_string(),
                     ty: LuaType::Function,
                 }],
-                returns: vec![LuaType::Thread],
+                returns: vec![LuaType::Thread.into()],
                 doc: None,
             }],
             ..Default::default()
@@ -1095,7 +1099,7 @@ function print_colored(msg, color) end
                 name: "maybe".to_string(),
                 is_async: false,
                 params: vec![],
-                returns: vec![LuaType::Nil],
+                returns: vec![LuaType::Nil.into()],
                 doc: None,
             }],
             ..Default::default()
@@ -1122,7 +1126,7 @@ function print_colored(msg, color) end
                         LuaParam { name: "y".to_string(), ty: LuaType::Number },
                         LuaParam { name: "z".to_string(), ty: LuaType::Number },
                     ],
-                    returns: vec![LuaType::Class("Vec3".to_string())],
+                    returns: vec![LuaType::Class("Vec3".to_string()).into()],
                     doc: None,
                 }],
             }],
@@ -1144,7 +1148,7 @@ function print_colored(msg, color) end
                     kind: MethodKind::Method,
                     is_async: false,
                     params: vec![],
-                    returns: vec![LuaType::Number],
+                    returns: vec![LuaType::Number.into()],
                     doc: None,
                 }],
             }],
@@ -1223,7 +1227,7 @@ function print_colored(msg, color) end
                     name: "init".to_string(),
                     is_async: false,
                     params: vec![],
-                    returns: vec![LuaType::Boolean],
+                    returns: vec![LuaType::Boolean.into()],
                     doc: None,
                 }],
             }],
@@ -1371,7 +1375,7 @@ function print_colored(msg, color) end
                     name: "name".to_string(),
                     ty: LuaType::String,
                 }],
-                returns: vec![LuaType::String],
+                returns: vec![LuaType::String.into()],
                 doc: Some("Greet someone by name.".to_string()),
             }],
             ..Default::default()
@@ -1464,7 +1468,7 @@ function print_colored(msg, color) end
                             name: "input".to_string(),
                             ty: LuaType::String,
                         }],
-                        returns: vec![LuaType::Table],
+                        returns: vec![LuaType::Table.into()],
                         doc: None,
                     },
                     LuaMethod {
@@ -1481,7 +1485,7 @@ function print_colored(msg, color) end
                                 ty: LuaType::Table,
                             },
                         ],
-                        returns: vec![LuaType::Table, LuaType::Boolean],
+                        returns: vec![LuaType::Table.into(), LuaType::Boolean.into()],
                         doc: None,
                     },
                 ],
@@ -1581,7 +1585,7 @@ function print_colored(msg, color) end
                             name: "path".to_string(),
                             ty: LuaType::String,
                         }],
-                        returns: vec![LuaType::String],
+                        returns: vec![LuaType::String.into()],
                         doc: None,
                     },
                     LuaFunction {
@@ -1597,7 +1601,7 @@ function print_colored(msg, color) end
                                 ty: LuaType::String,
                             },
                         ],
-                        returns: vec![LuaType::String],
+                        returns: vec![LuaType::String.into()],
                         doc: None,
                     },
                 ],
@@ -1663,7 +1667,7 @@ function print_colored(msg, color) end
                     kind: MethodKind::Method,
                     is_async: true,
                     params: vec![LuaParam { name: "url".to_string(), ty: LuaType::String }],
-                    returns: vec![LuaType::String],
+                    returns: vec![LuaType::String.into()],
                     doc: Some("Fetch a URL.".to_string()),
                 }],
             }],

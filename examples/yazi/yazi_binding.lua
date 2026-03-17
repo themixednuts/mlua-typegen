@@ -448,8 +448,8 @@ function Access.create_new(create_new) end
 
 ---@async
 ---@param url UserDataRef
----@return any
----@return Error
+---@return any Nil
+---@return Error Io
 function Access:open(url) end
 
 ---@param read boolean
@@ -469,8 +469,8 @@ function Access.write(write) end
 local SizeCalculator = {}
 
 ---@async
----@return any
----@return Error
+---@return any Nil
+---@return Error Io
 function SizeCalculator:recv() end
 
 ---@class Cha
@@ -510,14 +510,14 @@ local MpscTx = {}
 ---@async
 ---@param value any
 ---@return boolean
----@return Error
+---@return Error custom
 function MpscTx:send(value) end
 
 ---@class MpscRx
 local MpscRx = {}
 
 ---@async
----@return any
+---@return any value
 ---@return boolean
 function MpscRx:recv() end
 
@@ -526,14 +526,14 @@ local MpscUnboundedTx = {}
 
 ---@param value any
 ---@return boolean
----@return Error
+---@return Error custom
 function MpscUnboundedTx:send(value) end
 
 ---@class MpscUnboundedRx
 local MpscUnboundedRx = {}
 
 ---@async
----@return any
+---@return any value
 ---@return boolean
 function MpscUnboundedRx:recv() end
 
@@ -542,15 +542,15 @@ local OneshotTx = {}
 
 ---@param value any
 ---@return boolean
----@return Error
+---@return Error custom
 function OneshotTx:send(value) end
 
 ---@class OneshotRx
 local OneshotRx = {}
 
 ---@async
----@return any
----@return Error
+---@return any Nil
+---@return Error custom
 function OneshotRx:recv() end
 
 ---@class ChordCow
@@ -588,19 +588,19 @@ local Fd = {}
 
 ---@async
 ---@return boolean
----@return Error
+---@return Error Io
 function Fd:flush() end
 
 ---@async
 ---@param len integer
----@return any
----@return Error
+---@return any Nil
+---@return Error Io
 function Fd:read(len) end
 
 ---@async
 ---@param src string
 ---@return boolean
----@return Error
+---@return Error Io
 function Fd:write_all(src) end
 
 ---@class File
@@ -736,7 +736,7 @@ local Scheme = {}
 local FolderStage = {}
 
 ---@return boolean
----@return Error
+---@return Error Fs
 function FolderStage:__call() end
 
 ---@class Style
