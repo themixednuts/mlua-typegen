@@ -34,6 +34,8 @@ pub enum LuaType {
     Class(String),
     /// A union of string literals: `"a" | "b" | "c"`
     StringLiteral(Vec<String>),
+    /// A union of types: `T | U`
+    Union(Vec<LuaType>),
     /// A Lua thread (coroutine).
     Thread,
     /// Variadic: `T...`
@@ -74,6 +76,15 @@ impl fmt::Display for LuaType {
                         write!(f, " | ")?;
                     }
                     write!(f, "\"{v}\"")?;
+                }
+                Ok(())
+            }
+            LuaType::Union(types) => {
+                for (i, t) in types.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, " | ")?;
+                    }
+                    write!(f, "{t}")?;
                 }
                 Ok(())
             }
@@ -174,6 +185,57 @@ pub struct LuaModule {
     pub doc: Option<String>,
     pub functions: Vec<LuaFunction>,
     pub fields: Vec<LuaField>,
+}
+
+/// Build a union type from collected branch types.
+/// Deduplicates, collapses `T | nil` → `Optional(T)`, and simplifies single-element unions.
+pub fn make_union(types: Vec<LuaType>) -> LuaType {
+    // Flatten nested unions
+    let mut flat: Vec<LuaType> = Vec::new();
+    for ty in types {
+        match ty {
+            LuaType::Union(inner) => flat.extend(inner),
+            LuaType::Optional(inner) => {
+                flat.push(*inner);
+                flat.push(LuaType::Nil);
+            }
+            other => flat.push(other),
+        }
+    }
+
+    // Deduplicate (preserving order)
+    let mut seen = Vec::new();
+    for ty in flat {
+        if !seen.contains(&ty) {
+            seen.push(ty);
+        }
+    }
+
+    // Remove Any — if we have concrete types, Any is just noise
+    let has_concrete = seen.iter().any(|t| !matches!(t, LuaType::Any | LuaType::Nil));
+    if has_concrete {
+        seen.retain(|t| !matches!(t, LuaType::Any));
+    }
+
+    // Extract nil for optional handling
+    let has_nil = seen.iter().any(|t| matches!(t, LuaType::Nil));
+    if has_nil {
+        seen.retain(|t| !matches!(t, LuaType::Nil));
+    }
+
+    let base = match seen.len() {
+        0 => {
+            return if has_nil { LuaType::Nil } else { LuaType::Any };
+        }
+        1 => seen.into_iter().next().unwrap(),
+        _ => LuaType::Union(seen),
+    };
+
+    if has_nil {
+        LuaType::Optional(Box::new(base))
+    } else {
+        base
+    }
 }
 
 /// The complete Lua API surface extracted from a crate.
