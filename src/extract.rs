@@ -2327,6 +2327,8 @@ fn find_match_expr<'tcx>(expr: &'tcx hir::Expr<'tcx>) -> Option<&'tcx hir::Expr<
 }
 
 fn extract_bytes_key_from_pat(tcx: TyCtxt<'_>, pat: &hir::Pat<'_>) -> Option<String> {
+    // Byte string literal patterns (b"__pairs") — extract via source span
+    // since the HIR representation for byte str patterns varies across nightly versions
     let snippet = tcx.sess.source_map().span_to_snippet(pat.span).ok()?;
     let snippet = snippet.trim();
     if snippet == "_" {
