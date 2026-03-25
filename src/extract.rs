@@ -2677,21 +2677,13 @@ fn extract_named_fn_callback_signature<'tcx>(
         && let rustc_hir::Node::Item(item) = tcx.hir_node_by_def_id(local)
         && let hir::ItemKind::Fn { sig: fn_sig, .. } = &item.kind
         && let hir::FnRetTy::Return(ret_hir_ty) = &fn_sig.decl.output
-        && let Ok(snippet) = tcx.sess.source_map().span_to_snippet(ret_hir_ty.span)
     {
-        let snippet = snippet.trim();
-        // Unwrap Result<T, _> or mlua::Result<T>
-        let inner = snippet
-            .strip_prefix("mlua::Result<")
-            .or_else(|| snippet.strip_prefix("Result<"))
-            .and_then(|s| s.strip_suffix('>'))
-            .unwrap_or(snippet);
-        if inner == "()" || inner.is_empty() {
-            returns = vec![];
-        } else {
-            let ty = lua_type_from_extracted_name(inner);
-            if is_informative(&ty) {
-                returns = vec![ty.into()];
+        // Try to resolve via HIR type structure (unwrapping Result<T>)
+        if let Some(lua_ty) = unwrap_hir_result_type(tcx, ret_hir_ty) {
+            if lua_ty == LuaType::Nil {
+                returns = vec![];
+            } else if is_informative(&lua_ty) {
+                returns = vec![lua_ty.into()];
             }
         }
     }
@@ -3115,35 +3107,65 @@ fn resolve_table_get_module_name(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> Optio
 }
 
 /// Extract a cross-module function call from a closure snippet.
-/// Looks for patterns like `.get("func_name")` followed by `.call` or `.call_async`.
-/// Returns `module.func_name` or just `func_name` for cross-crate lookup.
-fn extract_cross_module_call_from_snippet(snippet: &str) -> Option<String> {
-    // Find the last .get("name") before a .call / .call_async
-    let call_pos = snippet
-        .rfind(".call_async")
-        .or_else(|| snippet.rfind(".call("))?;
-    let before_call = &snippet[..call_pos];
-
-    // Find the last .get("name") pattern
-    let get_pos = before_call.rfind(".get(")?;
-    let after_get = &before_call[get_pos + 5..]; // skip ".get("
-    let func_name = after_get.split('"').nth(1)?;
-    if func_name.is_empty() {
-        return None;
-    }
-
-    // Try to find the module name from an earlier .get("module")
-    let before_func_get = &before_call[..get_pos];
-    if let Some(mod_get_pos) = before_func_get.rfind(".get(") {
-        let after_mod_get = &before_func_get[mod_get_pos + 5..];
-        if let Some(mod_name) = after_mod_get.split('"').nth(1)
-            && !mod_name.is_empty()
-        {
-            return Some(format!("{mod_name}.{func_name}"));
+/// Walk HIR to find cross-module function calls: `table.get("name")` → `func.call_async()`.
+/// Handles async closures by walking through Closure and Block desugaring.
+fn find_cross_module_call_in_hir<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+) -> Option<String> {
+    let expr = peel_expr(expr);
+    match &expr.kind {
+        hir::ExprKind::MethodCall(segment, receiver, _args, _) => {
+            let method = segment.ident.name.as_str();
+            if matches!(method, "call" | "call_async") {
+                return resolve_table_get_function_name(tcx, receiver);
+            }
+            find_cross_module_call_in_hir(tcx, receiver)
         }
+        hir::ExprKind::Block(block, _) => {
+            if let Some(tail) = block.expr
+                && let Some(name) = find_cross_module_call_in_hir(tcx, tail)
+            {
+                return Some(name);
+            }
+            for stmt in block.stmts.iter().rev() {
+                match &stmt.kind {
+                    hir::StmtKind::Expr(e) | hir::StmtKind::Semi(e) => {
+                        if let Some(name) = find_cross_module_call_in_hir(tcx, e) {
+                            return Some(name);
+                        }
+                    }
+                    hir::StmtKind::Let(local)
+                        if let Some(init) = local.init
+                            && let Some(name) = find_cross_module_call_in_hir(tcx, init) =>
+                    {
+                        return Some(name);
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        hir::ExprKind::Closure(closure) => {
+            let body = tcx.hir_body(closure.body);
+            find_cross_module_call_in_hir(tcx, body.value)
+        }
+        hir::ExprKind::Match(scrutinee, arms, _) => find_cross_module_call_in_hir(tcx, scrutinee)
+            .or_else(|| {
+                arms.iter()
+                    .find_map(|arm| find_cross_module_call_in_hir(tcx, arm.body))
+            }),
+        hir::ExprKind::Call(callee, args) => {
+            find_cross_module_call_in_hir(tcx, callee).or_else(|| {
+                args.iter()
+                    .find_map(|a| find_cross_module_call_in_hir(tcx, a))
+            })
+        }
+        hir::ExprKind::DropTemps(inner) | hir::ExprKind::AddrOf(_, _, inner) => {
+            find_cross_module_call_in_hir(tcx, inner)
+        }
+        _ => None,
     }
-
-    Some(func_name.to_string())
 }
 
 /// Peel `.to_dynamic()` method calls to get the original typed receiver.
@@ -3999,7 +4021,7 @@ fn extract_closure_signature(
     // Cross-crate lookup fallback: if returns are uninformative and the closure
     // calls a function retrieved from a module by name, emit a @lookup: marker.
     if returns.iter().all(|r| !is_informative(&r.ty))
-        && let Some(func_name) = extract_cross_module_call_from_snippet(&closure_snippet)
+        && let Some(func_name) = find_cross_module_call_in_hir(tcx, body.value)
     {
         returns = vec![LuaType::Class(format!("@lookup:{func_name}")).into()];
     }
@@ -4117,8 +4139,13 @@ fn explicit_lua_params_from_hir<'tcx>(
 
     let names = extract_names_from_pat(param.pat);
     let expected_len = names.len().max(1);
-    let snippet = tcx.sess.source_map().span_to_snippet(param.ty_span).ok()?;
-    let types = explicit_param_types_from_type_snippet(&snippet, expected_len)?;
+
+    // Prefer typeck-resolved types over snippet parsing
+    let types =
+        explicit_param_types_from_typeck(tcx, body, params_idx, expected_len).or_else(|| {
+            let snippet = tcx.sess.source_map().span_to_snippet(param.ty_span).ok()?;
+            explicit_param_types_from_type_snippet(&snippet, expected_len)
+        })?;
 
     Some(
         types
@@ -4135,19 +4162,44 @@ fn explicit_lua_params_from_hir<'tcx>(
     )
 }
 
-fn explicit_param_types_from_body_param(
-    tcx: TyCtxt<'_>,
-    body: &hir::Body<'_>,
+/// Extract param types from typeck instead of source text snippets.
+fn explicit_param_types_from_typeck<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &'tcx hir::Body<'tcx>,
     params_idx: usize,
     expected_len: usize,
 ) -> Option<Vec<LuaType>> {
     let param = body.params.get(params_idx)?;
-    if param.ty_span == param.pat.span {
-        return None;
-    }
+    let typeck = tcx.typeck(param.pat.hir_id.owner.def_id);
+    let ty = typeck.node_type(param.pat.hir_id);
 
-    let snippet = tcx.sess.source_map().span_to_snippet(param.ty_span).ok()?;
-    explicit_param_types_from_type_snippet(&snippet, expected_len)
+    let types = match ty.kind() {
+        ty::TyKind::Tuple(fields) if fields.len() == expected_len => {
+            fields.iter().map(|t| map_ty_to_lua(tcx, t)).collect()
+        }
+        _ if expected_len == 1 => vec![map_ty_to_lua(tcx, ty)],
+        _ => return None,
+    };
+
+    // Only use typeck types if they're informative (not all Any)
+    types.iter().any(is_informative).then_some(types)
+}
+
+fn explicit_param_types_from_body_param<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &'tcx hir::Body<'tcx>,
+    params_idx: usize,
+    expected_len: usize,
+) -> Option<Vec<LuaType>> {
+    // Prefer typeck over snippet parsing
+    explicit_param_types_from_typeck(tcx, body, params_idx, expected_len).or_else(|| {
+        let param = body.params.get(params_idx)?;
+        if param.ty_span == param.pat.span {
+            return None;
+        }
+        let snippet = tcx.sess.source_map().span_to_snippet(param.ty_span).ok()?;
+        explicit_param_types_from_type_snippet(&snippet, expected_len)
+    })
 }
 
 fn explicit_param_types_from_closure_snippet(
@@ -5107,6 +5159,13 @@ fn lua_type_from_hir_ty_with_snippet<'hir, A>(
 }
 
 fn ty_snippet_to_lua_type<'hir, A>(tcx: TyCtxt<'_>, ty: &hir::Ty<'hir, A>) -> Option<LuaType> {
+    // Try to resolve via HIR type structure first
+    if let Some(lua_ty) = hir_ty_to_lua_type(tcx, ty)
+        && is_informative(&lua_ty)
+    {
+        return Some(lua_ty);
+    }
+    // Fallback to snippet parsing
     let mut snippet = tcx.sess.source_map().span_to_snippet(ty.span).ok()?;
     snippet = snippet.trim().to_string();
 
@@ -5118,6 +5177,78 @@ fn ty_snippet_to_lua_type<'hir, A>(tcx: TyCtxt<'_>, ty: &hir::Ty<'hir, A>) -> Op
     }
 
     (!snippet.is_empty()).then(|| lua_type_from_extracted_name(&snippet))
+}
+
+/// Unwrap `Result<T, _>` from an HIR return type, returning the inner T as LuaType.
+fn unwrap_hir_result_type<A>(tcx: TyCtxt<'_>, ty: &hir::Ty<'_, A>) -> Option<LuaType> {
+    match &ty.kind {
+        hir::TyKind::Path(qpath) => {
+            let last_seg = match qpath {
+                hir::QPath::Resolved(_, path) => path.segments.last()?,
+                hir::QPath::TypeRelative(_, seg) => seg,
+            };
+            let name = last_seg.ident.name.as_str();
+            if name == "Result" {
+                // Result<T, _> — get the first type arg
+                if let Some(args) = last_seg.args
+                    && let Some(hir::GenericArg::Type(inner_ty)) = args.args.first()
+                {
+                    return hir_ty_to_lua_type(tcx, inner_ty);
+                }
+                // Result<()> or bare Result
+                return Some(LuaType::Nil);
+            }
+            // Not a Result — convert directly
+            hir_ty_to_lua_type(tcx, ty)
+        }
+        _ => hir_ty_to_lua_type(tcx, ty),
+    }
+}
+
+/// Convert an HIR type to LuaType using the type structure instead of snippets.
+#[allow(clippy::only_used_in_recursion)]
+fn hir_ty_to_lua_type<A>(tcx: TyCtxt<'_>, ty: &hir::Ty<'_, A>) -> Option<LuaType> {
+    match &ty.kind {
+        hir::TyKind::Ref(_, ref_ty) => hir_ty_to_lua_type(tcx, ref_ty.ty),
+        hir::TyKind::Path(qpath) => {
+            let path_str = match qpath {
+                hir::QPath::Resolved(_, path) => path
+                    .segments
+                    .iter()
+                    .map(|s| s.ident.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("::"),
+                hir::QPath::TypeRelative(_, seg) => seg.ident.name.as_str().to_string(),
+            };
+
+            // Extract generic args if present
+            let type_args: Vec<LuaType> = match qpath {
+                hir::QPath::Resolved(_, path) => path
+                    .segments
+                    .last()
+                    .and_then(|seg| seg.args)
+                    .map(|args| {
+                        args.args
+                            .iter()
+                            .filter_map(|arg| {
+                                if let hir::GenericArg::Type(inner_ty) = arg {
+                                    hir_ty_to_lua_type(tcx, inner_ty)
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                _ => vec![],
+            };
+
+            let mapped = map_rust_type(&path_str, &type_args);
+            Some(mapped)
+        }
+        hir::TyKind::Tup([]) => Some(LuaType::Nil),
+        _ => None,
+    }
 }
 
 fn method_generic_lua_type(
