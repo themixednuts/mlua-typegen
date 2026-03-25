@@ -430,6 +430,11 @@ fn heuristic_type_match(rust_type: &str, type_args: &[LuaType]) -> LuaType {
         "Thread" | "LuaThread" => return LuaType::Thread,
         "Error" | "LuaError" => return LuaType::String,
         "AnyUserData" | "LuaAnyUserData" | "Lua" => return LuaType::Any,
+        // Common Rust types that might not go through the full path match
+        "PathBuf" | "OsString" | "OsStr" | "CString" | "CStr" | "BString" => {
+            return LuaType::String;
+        }
+        "Cow" => return type_args.first().cloned().unwrap_or(LuaType::Any),
         _ => {}
     }
 

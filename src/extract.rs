@@ -5818,6 +5818,7 @@ fn lua_type_from_extracted_name(name: &str) -> LuaType {
         "UserDataRefMut<",
         "Ref<",
         "RefMut<",
+        "Cow<",
         "MutexGuard<",
         "RwLockReadGuard<",
         "RwLockWriteGuard<",
@@ -5844,7 +5845,8 @@ fn lua_type_from_extracted_name(name: &str) -> LuaType {
     }
 
     match qualified_name {
-        "String" | "BString" | "LuaString" => LuaType::String,
+        "String" | "BString" | "LuaString" | "PathBuf" | "OsString" | "OsStr" | "CString"
+        | "CStr" => LuaType::String,
         "str" => LuaType::String,
         "Integer" => LuaType::Integer,
         "i8" | "i16" | "i32" | "i64" | "i128" | "isize" => LuaType::Integer,
@@ -5948,11 +5950,13 @@ fn pat_to_name(pat: &hir::Pat<'_>) -> String {
     match &pat.kind {
         hir::PatKind::Binding(_, _, ident, _) => {
             let name = ident.name.as_str();
-            // Skip the underscore prefix that rustc sometimes adds
-            name.strip_prefix('_')
-                .filter(|s| !s.is_empty())
-                .unwrap_or(name)
-                .to_string()
+            // Strip leading underscores (Rust unused-variable convention)
+            let stripped = name.trim_start_matches('_');
+            if stripped.is_empty() {
+                name.to_string()
+            } else {
+                stripped.to_string()
+            }
         }
         _ => "_".to_string(),
     }
