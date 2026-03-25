@@ -2438,6 +2438,16 @@ fn try_extract_create_function<'tcx>(
 }
 
 /// Unwrap `expr?` → `expr` (strip the Try/Match desugaring).
+/// Check if an expression is a `?` (try) desugaring — these are error paths, not success returns.
+fn is_try_desugar_expr(expr: &hir::Expr<'_>) -> bool {
+    let expr = peel_expr(expr);
+    matches!(
+        &expr.kind,
+        hir::ExprKind::Match(_, _, hir::MatchSource::TryDesugar(_))
+    ) || matches!(&expr.kind, hir::ExprKind::Call(_, args) if args.first().is_some_and(|a|
+        matches!(&a.kind, hir::ExprKind::Match(_, _, hir::MatchSource::TryDesugar(_)))))
+}
+
 fn unwrap_try_expr<'tcx>(expr: &'tcx hir::Expr<'tcx>) -> &'tcx hir::Expr<'tcx> {
     // In HIR, `expr?` desugars to a match. Just try to look through it.
     if let hir::ExprKind::Match(scrutinee, _, hir::MatchSource::TryDesugar(_)) = &expr.kind {
@@ -3900,6 +3910,7 @@ fn refine_params_from_body<'tcx>(
             infer_table_param_type_from_body(tcx, expr, &param.name),
             infer_table_param_type_from_converter_calls(tcx, expr, &param.name),
             infer_json_like_param_type_from_body(tcx, expr, &param.name),
+            infer_from_lua_conversion_type(tcx, expr, &param.name),
         ]
         .into_iter()
         .flatten()
@@ -5099,6 +5110,68 @@ fn infer_any_userdata_param_type_from_body<'tcx>(
             infer_any_userdata_param_type_from_body(tcx, inner, param_name)
         }
         _ => None,
+    }
+}
+
+/// Infer a param's type from `from_lua::<T>(param)` or `let x: T = from_lua(param)?` patterns.
+/// When a `Value` param is immediately converted via `from_lua`, the target type reveals the
+/// actual expected Lua type.
+fn infer_from_lua_conversion_type<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+    param_name: &str,
+) -> Option<LuaType> {
+    let expr = peel_try_expr(expr);
+
+    match &expr.kind {
+        hir::ExprKind::Block(block, _) => {
+            for stmt in block.stmts {
+                // Look for: let var: T = from_lua(param)?;
+                if let hir::StmtKind::Let(local) = &stmt.kind
+                    && let Some(init) = local.init
+                {
+                    let init = peel_try_expr(init);
+                    if is_from_lua_call_on_param(init, param_name) {
+                        // Get the type of the let binding from typeck
+                        let typeck = tcx.typeck(local.pat.hir_id.owner.def_id);
+                        let ty = typeck.node_type(local.pat.hir_id);
+                        let lua_ty = map_ty_to_lua(tcx, ty);
+                        if is_informative(&lua_ty) {
+                            return Some(lua_ty);
+                        }
+                    }
+                }
+                // Recurse into expressions
+                if let hir::StmtKind::Expr(e) | hir::StmtKind::Semi(e) = &stmt.kind
+                    && let Some(ty) = infer_from_lua_conversion_type(tcx, e, param_name)
+                {
+                    return Some(ty);
+                }
+            }
+            block
+                .expr
+                .and_then(|e| infer_from_lua_conversion_type(tcx, e, param_name))
+        }
+        _ => None,
+    }
+}
+
+/// Check if an expression is a `from_lua(param)` or `from_dynamic(param)` call.
+fn is_from_lua_call_on_param(expr: &hir::Expr<'_>, param_name: &str) -> bool {
+    match &expr.kind {
+        hir::ExprKind::Call(callee, args) => {
+            let name = called_path_name(callee);
+            if name.as_deref().is_some_and(|n| {
+                n == "from_lua" || n == "from_dynamic" || n == "from_lua_value_dynamic"
+            }) && args
+                .iter()
+                .any(|arg| expr_refers_to_binding(arg, param_name))
+            {
+                return true;
+            }
+            false
+        }
+        _ => false,
     }
 }
 
@@ -7701,18 +7774,20 @@ fn infer_returns_from_expr<'tcx>(
             for stmt in block.stmts {
                 match &stmt.kind {
                     hir::StmtKind::Let(local) => {
-                        if let Some(init) = local
-                            .init
-                            .filter(|init| expr_contains_return(init))
-                            .and_then(|init| infer_returns_from_expr(tcx, init))
+                        // Skip ? desugaring in let bindings — those are error paths
+                        if let Some(init) = local.init
+                            && !is_try_desugar_expr(init)
+                            && expr_contains_return(init)
+                            && let Some(returns) = infer_returns_from_expr(tcx, init)
                         {
-                            branches.push(init);
+                            branches.push(returns);
                         }
                     }
                     hir::StmtKind::Expr(expr) | hir::StmtKind::Semi(expr) => {
-                        if let Some(returns) = expr_contains_return(expr)
-                            .then(|| infer_returns_from_expr(tcx, expr))
-                            .flatten()
+                        // Skip ? desugaring statements — those are error paths
+                        if !is_try_desugar_expr(expr)
+                            && expr_contains_return(expr)
+                            && let Some(returns) = infer_returns_from_expr(tcx, expr)
                         {
                             branches.push(returns);
                         }
