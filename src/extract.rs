@@ -4179,6 +4179,13 @@ fn explicit_param_types_from_typeck<'tcx>(
         ty::TyKind::Tuple(fields) if fields.len() == expected_len => {
             fields.iter().map(|t| map_ty_to_lua(tcx, t)).collect()
         }
+        // Tuple has more fields than expected — take the trailing elements
+        // (the leading fields were likely AnyUserData self params already stripped)
+        ty::TyKind::Tuple(fields) if fields.len() > expected_len => fields
+            .iter()
+            .skip(fields.len() - expected_len)
+            .map(|t| map_ty_to_lua(tcx, t))
+            .collect(),
         _ if expected_len == 1 => vec![map_ty_to_lua(tcx, ty)],
         _ => return None,
     };
@@ -4631,13 +4638,7 @@ fn infer_sequence_values_item_type<'tcx>(
                     return Some(lua_ty);
                 }
                 // Try typeck-resolved generics
-                if let Some(lua_ty) = typeck_method_generic_type(tcx, expr) {
-                    return Some(lua_ty);
-                }
-                // Final snippet fallback
-                return snippet_generic_type_name(&expr_snippet(tcx, expr), "sequence_values::<")
-                    .as_deref()
-                    .map(lua_type_from_extracted_name);
+                return typeck_method_generic_type(tcx, expr);
             }
 
             infer_sequence_values_item_type(tcx, receiver, binding_name)
@@ -5259,15 +5260,7 @@ fn method_generic_lua_type(
     }
 
     // Try typeck-resolved generic args (handles inferred generics)
-    if let Some(lua_ty) = typeck_method_generic_type(tcx, expr) {
-        return Some(lua_ty);
-    }
-
-    // Final fallback: parse source snippet for turbofish
-    let marker = format!("{}::<", segment.ident.name.as_str());
-    snippet_generic_type_name(&expr_snippet(tcx, expr), &marker)
-        .as_deref()
-        .map(lua_type_from_extracted_name)
+    typeck_method_generic_type(tcx, expr)
 }
 
 /// Resolve the first generic type argument of a method call via typeck.
@@ -5290,9 +5283,9 @@ fn typeck_method_generic_type(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> Option<L
     None
 }
 
-fn callee_try_from_type_name(tcx: TyCtxt<'_>, callee: &hir::Expr<'_>) -> Option<String> {
+fn callee_try_from_type_name(_tcx: TyCtxt<'_>, callee: &hir::Expr<'_>) -> Option<String> {
     let callee = peel_expr(callee);
-    let name = match &callee.kind {
+    match &callee.kind {
         hir::ExprKind::Path(qpath) => match qpath {
             hir::QPath::TypeRelative(ty, seg) if seg.ident.name.as_str() == "try_from" => {
                 let hir::TyKind::Path(qpath) = &ty.kind else {
@@ -5311,9 +5304,7 @@ fn callee_try_from_type_name(tcx: TyCtxt<'_>, callee: &hir::Expr<'_>) -> Option<
             _ => None,
         },
         _ => None,
-    };
-
-    name.or_else(|| snippet_type_before_method(&expr_snippet(tcx, callee), "try_from"))
+    }
 }
 
 fn qpath_last_name(qpath: &hir::QPath<'_>) -> Option<String> {
@@ -5342,10 +5333,7 @@ fn infer_any_userdata_param_type_from_body<'tcx>(
                 .filter_map(|arm| extract_type_id_guard_lua_type(tcx, arm.guard))
                 .collect();
             if tys.is_empty() {
-                tys = extract_all_generic_type_names(&expr_snippet(tcx, expr), "TypeId::of::<")
-                    .into_iter()
-                    .map(LuaType::Class)
-                    .collect();
+                tys = infer_value_converter_types_from_hir(tcx, expr);
             }
             (!tys.is_empty()).then(|| make_union(tys))
         }
@@ -6604,9 +6592,7 @@ fn extract_type_id_guard_lua_type(
 fn extract_type_id_of_lua_type(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> Option<LuaType> {
     let expr = peel_try_expr(expr);
     let hir::ExprKind::Call(callee, _) = &expr.kind else {
-        return typeck_call_generic_type(tcx, expr).or_else(|| {
-            snippet_generic_type_name(&expr_snippet(tcx, expr), "TypeId::of::<").map(LuaType::Class)
-        });
+        return typeck_call_generic_type(tcx, expr);
     };
     let args = match &callee.kind {
         hir::ExprKind::Path(hir::QPath::TypeRelative(_, seg))
@@ -6631,10 +6617,8 @@ fn extract_type_id_of_lua_type(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> Option<
         return Some(lua_ty);
     }
 
-    // Fallback: typeck or snippet
-    typeck_call_generic_type(tcx, expr).or_else(|| {
-        snippet_generic_type_name(&expr_snippet(tcx, expr), "TypeId::of::<").map(LuaType::Class)
-    })
+    // Fallback: typeck
+    typeck_call_generic_type(tcx, expr)
 }
 
 /// Resolve the first generic type argument of a function call via typeck.
@@ -6746,12 +6730,6 @@ fn last_path_segment(name: &str) -> &str {
     &name[last..]
 }
 
-fn snippet_generic_type_name(snippet: &str, marker: &str) -> Option<String> {
-    extract_all_generic_type_names(snippet, marker)
-        .into_iter()
-        .next()
-}
-
 fn extract_all_generic_type_names(snippet: &str, marker: &str) -> Vec<String> {
     let mut names = Vec::new();
     let mut rest = snippet;
@@ -6792,14 +6770,6 @@ fn extract_balanced_generic_arg(input: &str) -> Option<(&str, usize)> {
     }
 
     None
-}
-
-fn snippet_type_before_method(snippet: &str, method: &str) -> Option<String> {
-    let marker = format!("::{method}");
-    let idx = snippet.find(&marker)?;
-    let prefix = &snippet[..idx];
-    let name = prefix.rsplit("::").next()?.trim();
-    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// Get a name from a simple binding pattern, falling back to `_`.
