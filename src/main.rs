@@ -44,9 +44,9 @@ fn main() -> ExitCode {
         invalidate_source_mtime();
     }
 
-    // Clean stale event emissions from previous runs
-    let events_file = output_dir.join(".events.txt");
-    let _ = fs::remove_file(&events_file);
+    // Clean stale shared data from previous runs
+    let _ = fs::remove_file(output_dir.join(".events.txt"));
+    let _ = fs::remove_file(output_dir.join(".func_types.txt"));
 
     // Find the driver binary (installed alongside this binary)
     let driver = find_driver();
@@ -91,12 +91,59 @@ fn main() -> ExitCode {
             if let Err(e) = mlua_typegen::codegen::write_events_file(&output_dir) {
                 eprintln!("mlua-typegen: failed to write events file: {e}");
             }
+            // Resolve cross-crate @lookup: markers in stub files
+            resolve_cross_crate_lookups(&output_dir);
             ExitCode::SUCCESS
         }
         Ok(s) => ExitCode::from(s.code().unwrap_or(1) as u8),
         Err(e) => {
             eprintln!("error: failed to run cargo: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// Resolve `@lookup:module.func_name` markers in generated stubs by looking up
+/// the function's return type from the cross-crate function registry.
+fn resolve_cross_crate_lookups(output_dir: &Path) {
+    let func_types = mlua_typegen::codegen::read_function_types(output_dir);
+    if func_types.is_empty() {
+        return;
+    }
+
+    // Scan all .lua files for @lookup: markers
+    let Ok(entries) = fs::read_dir(output_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("lua") {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if !content.contains("@lookup:") {
+            continue;
+        }
+        let mut patched = content.clone();
+        for (key, returns) in &func_types {
+            let marker = format!("@lookup:{key}");
+            if patched.contains(&marker) {
+                let replacement = returns.join(", ");
+                patched = patched.replace(&marker, &replacement);
+            }
+            // Also try without module prefix for bare function name lookups
+            if let Some(func_name) = key.rsplit('.').next() {
+                let bare_marker = format!("@lookup:{func_name}");
+                if patched.contains(&bare_marker) {
+                    let replacement = returns.join(", ");
+                    patched = patched.replace(&bare_marker, &replacement);
+                }
+            }
+        }
+        if patched != content {
+            let _ = fs::write(&path, patched);
         }
     }
 }

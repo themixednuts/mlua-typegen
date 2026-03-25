@@ -3050,6 +3050,102 @@ fn peel_try_expr<'tcx>(mut expr: &'tcx hir::Expr<'tcx>) -> &'tcx hir::Expr<'tcx>
     }
 }
 
+/// Resolve a function receiver to a `table.get("name")` call, returning the full
+/// `module.function_name` path for cross-crate lookup.
+/// Traces through local variable bindings: `let func: Function = table.get("name")?`
+fn resolve_table_get_function_name(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> Option<String> {
+    // Direct: table.get("name")
+    if let Some(name) = extract_table_get_name(tcx, expr) {
+        return Some(name);
+    }
+    // Local variable: resolve to initializer
+    if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = &expr.kind
+        && let rustc_hir::def::Res::Local(hir_id) = path.res
+        && let rustc_hir::Node::Pat(pat) = tcx.hir_node(hir_id)
+        && let rustc_hir::Node::LetStmt(local) = tcx.hir_node(tcx.parent_hir_id(pat.hir_id))
+        && let Some(init) = local.init
+    {
+        let init = peel_try_expr(init);
+        return extract_table_get_name(tcx, init);
+    }
+    None
+}
+
+/// Extract the function name from `table.get("name")` method calls.
+/// Returns `module_name.function_name` if the receiver is itself a `get("module")` on a module.
+fn extract_table_get_name(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> Option<String> {
+    let hir::ExprKind::MethodCall(segment, receiver, args, _) = &expr.kind else {
+        return None;
+    };
+    if segment.ident.name.as_str() != "get" || args.is_empty() {
+        return None;
+    }
+    let func_name = extract_string_literal_from_expr(tcx, &args[0])?;
+
+    // Try to get module name from receiver: module_table.get("func_name")
+    // where module_table = parent.get("module_name")
+    let module_name = resolve_table_get_module_name(tcx, receiver);
+    if let Some(module) = module_name {
+        Some(format!("{module}.{func_name}"))
+    } else {
+        Some(func_name)
+    }
+}
+
+/// Resolve the module name from a table receiver: `wezterm_mod.get("gui")` → "gui"
+fn resolve_table_get_module_name(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> Option<String> {
+    // Direct table.get("module_name")
+    if let hir::ExprKind::MethodCall(segment, _, args, _) = &expr.kind
+        && segment.ident.name.as_str() == "get"
+        && !args.is_empty()
+    {
+        return extract_string_literal_from_expr(tcx, &args[0]);
+    }
+    // Local variable
+    if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = &expr.kind
+        && let rustc_hir::def::Res::Local(hir_id) = path.res
+        && let rustc_hir::Node::Pat(pat) = tcx.hir_node(hir_id)
+        && let rustc_hir::Node::LetStmt(local) = tcx.hir_node(tcx.parent_hir_id(pat.hir_id))
+        && let Some(init) = local.init
+    {
+        let init = peel_try_expr(init);
+        return resolve_table_get_module_name(tcx, init);
+    }
+    None
+}
+
+/// Extract a cross-module function call from a closure snippet.
+/// Looks for patterns like `.get("func_name")` followed by `.call` or `.call_async`.
+/// Returns `module.func_name` or just `func_name` for cross-crate lookup.
+fn extract_cross_module_call_from_snippet(snippet: &str) -> Option<String> {
+    // Find the last .get("name") before a .call / .call_async
+    let call_pos = snippet
+        .rfind(".call_async")
+        .or_else(|| snippet.rfind(".call("))?;
+    let before_call = &snippet[..call_pos];
+
+    // Find the last .get("name") pattern
+    let get_pos = before_call.rfind(".get(")?;
+    let after_get = &before_call[get_pos + 5..]; // skip ".get("
+    let func_name = after_get.split('"').nth(1)?;
+    if func_name.is_empty() {
+        return None;
+    }
+
+    // Try to find the module name from an earlier .get("module")
+    let before_func_get = &before_call[..get_pos];
+    if let Some(mod_get_pos) = before_func_get.rfind(".get(") {
+        let after_mod_get = &before_func_get[mod_get_pos + 5..];
+        if let Some(mod_name) = after_mod_get.split('"').nth(1)
+            && !mod_name.is_empty()
+        {
+            return Some(format!("{mod_name}.{func_name}"));
+        }
+    }
+
+    Some(func_name.to_string())
+}
+
 /// Peel `.to_dynamic()` method calls to get the original typed receiver.
 fn peel_to_dynamic<'tcx>(expr: &'tcx hir::Expr<'tcx>) -> &'tcx hir::Expr<'tcx> {
     if let hir::ExprKind::MethodCall(segment, receiver, _, _) = &expr.kind
@@ -3899,6 +3995,14 @@ fn extract_closure_signature(
 
     // Enrich multi-returns with names from the body's tuple expression
     enrich_return_names(tcx, body.value, &mut returns);
+
+    // Cross-crate lookup fallback: if returns are uninformative and the closure
+    // calls a function retrieved from a module by name, emit a @lookup: marker.
+    if returns.iter().all(|r| !is_informative(&r.ty))
+        && let Some(func_name) = extract_cross_module_call_from_snippet(&closure_snippet)
+    {
+        returns = vec![LuaType::Class(format!("@lookup:{func_name}")).into()];
+    }
 
     if trace_target {
         trace(format!(
@@ -7817,6 +7921,13 @@ fn infer_returns_from_expr<'tcx>(
                     } else {
                         None
                     }
+                }
+                // func.call(args) / func.call_async(args) where func comes from
+                // table.get("name") — emit deferred lookup marker for cross-crate resolution
+                "call" | "call_async"
+                    if let Some(func_name) = resolve_table_get_function_name(tcx, receiver) =>
+                {
+                    Some(vec![LuaType::Class(format!("@lookup:{func_name}")).into()])
                 }
                 _ if infer_forwarded_multivalue_returns(tcx, expr, segment, args).is_some() => {
                     infer_forwarded_multivalue_returns(tcx, expr, segment, args)

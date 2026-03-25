@@ -526,6 +526,9 @@ pub fn write_stubs_for(
         std::fs::write(&module_file, content)?;
     }
 
+    // Record function return types for cross-crate lookups
+    append_function_types(output_dir, api)?;
+
     // Write classes, enums, globals, and global functions to per-crate file
     let non_module_api = LuaApi {
         classes: api.classes.clone(),
@@ -547,6 +550,7 @@ pub fn write_stubs_for(
 }
 
 const EVENTS_FILE: &str = ".events.txt";
+const FUNC_TYPES_FILE: &str = ".func_types.txt";
 
 /// Append event emissions to a shared file for cross-crate accumulation.
 /// Format: one line per event: `event_name\ttype1\ttype2\t...`
@@ -566,6 +570,55 @@ pub fn append_event_emissions(
         writeln!(file, "{}\t{}", emission.event_name, types.join("\t"))?;
     }
     Ok(())
+}
+
+/// Append function return types to a shared file for cross-crate lookups.
+/// Format: `module.func_name\treturn_type1\treturn_type2...`
+fn append_function_types(output_dir: &Path, api: &LuaApi) -> std::io::Result<()> {
+    use std::io::Write as IoWrite;
+    let func_path = output_dir.join(FUNC_TYPES_FILE);
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(func_path)?;
+    for module in &api.modules {
+        for func in &module.functions {
+            if !func.returns.is_empty() {
+                let returns: Vec<String> = func.returns.iter().map(|r| r.ty.to_string()).collect();
+                writeln!(
+                    file,
+                    "{}.{}\t{}",
+                    module.name,
+                    func.name,
+                    returns.join("\t")
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Read function return types from the shared file.
+/// Returns a map of `module.func_name` → return type strings.
+pub fn read_function_types(output_dir: &Path) -> std::collections::HashMap<String, Vec<String>> {
+    let func_path = output_dir.join(FUNC_TYPES_FILE);
+    let Ok(content) = std::fs::read_to_string(func_path) else {
+        return std::collections::HashMap::new();
+    };
+    let mut map = std::collections::HashMap::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() >= 2 {
+            let key = parts[0].to_string();
+            let returns: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+            map.entry(key).or_insert(returns);
+        }
+    }
+    map
 }
 
 /// Read accumulated event emissions from the shared file.
