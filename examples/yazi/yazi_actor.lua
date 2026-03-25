@@ -4,7 +4,7 @@
 local Core = {}
 
 ---@param key string
----@return Tab | Tabs | Tasks | Yanked | Layer | Which?
+---@return (TO_DESTROY | Layer)?
 function Core:__index(key) end
 
 ---@class File
@@ -125,8 +125,8 @@ local Preview = {}
 ---@field finder Finder (readonly)
 local Tab = {}
 
----@param url UserDataRef
----@return Folder?
+---@param url Url
+---@return Folder
 function Tab:history(url) end
 
 ---@class Tabs
@@ -171,5 +171,7 @@ local Yanked = {}
 ---@return integer
 function Yanked:__len() end
 
----@return table
+---@return fun(p1: Iter<any, Url>): integer?, Url?
+---@return Iter<any, Url>
+---@return nil
 function Yanked:__pairs() end
