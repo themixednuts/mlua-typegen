@@ -175,6 +175,7 @@ fn write_overloaded_method(
         let params_sig = method
             .params
             .iter()
+            .filter(|p| p.ty != LuaType::Nil)
             .map(|p| {
                 if let LuaType::Variadic(inner) = &p.ty {
                     format!("...: {inner}")
@@ -290,6 +291,7 @@ fn write_overloaded_function(
         let params_sig = func
             .params
             .iter()
+            .filter(|p| p.ty != LuaType::Nil)
             .map(|p| {
                 if let LuaType::Variadic(inner) = &p.ty {
                     format!("...: {inner}")
@@ -361,6 +363,10 @@ fn write_global_field(out: &mut String, field: &crate::LuaField) {
 /// Write `---@param` annotations, with special handling for variadic params.
 fn write_params(out: &mut String, params: &[crate::LuaParam]) {
     for param in params {
+        // Skip unit/nil params — they represent () in Rust and have no Lua equivalent
+        if param.ty == LuaType::Nil {
+            continue;
+        }
         if let LuaType::Variadic(inner) = &param.ty {
             writeln!(out, "---@param ... {inner}").unwrap();
         } else {
@@ -372,6 +378,10 @@ fn write_params(out: &mut String, params: &[crate::LuaParam]) {
 /// Write `---@return` annotations for multiple return values.
 fn write_returns(out: &mut String, returns: &[crate::LuaReturn]) {
     for ret in returns {
+        // Skip error types — in Lua, errors are thrown (not returned)
+        if is_error_return(&ret.ty) {
+            continue;
+        }
         if let Some(name) = &ret.name {
             writeln!(out, "---@return {} {name}", ret.ty).unwrap();
         } else {
@@ -380,10 +390,17 @@ fn write_returns(out: &mut String, returns: &[crate::LuaReturn]) {
     }
 }
 
+/// Returns true if a type represents an error that shouldn't be a return annotation.
+fn is_error_return(ty: &LuaType) -> bool {
+    matches!(ty, LuaType::Class(name) if name == "Error" || name == "LuaError"
+        || name.ends_with("::Error") || name.ends_with("::LuaError"))
+}
+
 /// Convert params to the function signature string, replacing variadic params with `...`.
 fn params_to_str(params: &[crate::LuaParam]) -> String {
     params
         .iter()
+        .filter(|p| p.ty != LuaType::Nil)
         .map(|p| {
             if matches!(p.ty, LuaType::Variadic(_)) {
                 "..."

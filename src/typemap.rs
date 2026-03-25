@@ -412,6 +412,24 @@ fn heuristic_type_match(rust_type: &str, type_args: &[LuaType]) -> LuaType {
         return type_args[0].clone();
     }
 
+    // mlua types that might arrive via re-exports or short paths
+    match last_segment {
+        "Variadic" | "LuaVariadic" => {
+            let inner = type_args.first().cloned().unwrap_or(LuaType::Any);
+            return LuaType::Variadic(Box::new(inner));
+        }
+        "MultiValue" | "LuaMultiValue" => {
+            return LuaType::Variadic(Box::new(LuaType::Any));
+        }
+        "Value" | "LuaValue" => return LuaType::Any,
+        "Table" | "LuaTable" if type_args.is_empty() => return LuaType::Table,
+        "Function" | "LuaFunction" if type_args.is_empty() => return LuaType::Function,
+        "Thread" | "LuaThread" => return LuaType::Thread,
+        "Error" | "LuaError" => return LuaType::String,
+        "AnyUserData" | "LuaAnyUserData" => return LuaType::Any,
+        _ => {}
+    }
+
     // Default: use last segment as class name, preserving informative generic args
     if type_args.is_empty() {
         LuaType::Class(last_segment.to_string())
@@ -1267,10 +1285,10 @@ mod tests {
 
     #[test]
     fn heuristic_does_not_match_wrong_arg_count() {
-        // Map suffix with 1 arg → class (needs 2)
+        // Map suffix with 1 arg → class with preserved generic arg (needs 2 for table)
         assert_eq!(
             map_rust_type("custom::MyMap", &[LuaType::String]),
-            LuaType::Class("MyMap".to_string())
+            LuaType::Class("MyMap<string>".to_string())
         );
     }
 

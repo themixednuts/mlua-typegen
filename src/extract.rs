@@ -3797,7 +3797,7 @@ fn explicit_param_types_from_type_snippet(
     expected_len: usize,
 ) -> Option<Vec<LuaType>> {
     let snippet = snippet.trim();
-    if snippet.is_empty() {
+    if snippet.is_empty() || snippet == "()" {
         return None;
     }
 
@@ -5813,7 +5813,15 @@ fn lua_type_from_extracted_name(name: &str) -> LuaType {
         return LuaType::Array(Box::new(lua_type_from_extracted_name(inner.trim())));
     }
 
-    for wrapper in ["UserDataRef<", "UserDataRefMut<"] {
+    for wrapper in [
+        "UserDataRef<",
+        "UserDataRefMut<",
+        "Ref<",
+        "RefMut<",
+        "MutexGuard<",
+        "RwLockReadGuard<",
+        "RwLockWriteGuard<",
+    ] {
         if let Some(inner) = qualified_name
             .strip_prefix(wrapper)
             .and_then(|inner| inner.strip_suffix('>'))
@@ -5822,8 +5830,21 @@ fn lua_type_from_extracted_name(name: &str) -> LuaType {
         }
     }
 
+    // Variadic<T> → T...
+    if let Some(inner) = qualified_name
+        .strip_prefix("Variadic<")
+        .and_then(|inner| inner.strip_suffix('>'))
+    {
+        return LuaType::Variadic(Box::new(lua_type_from_extracted_name(inner.trim())));
+    }
+
+    // MultiValue → any...
+    if qualified_name == "MultiValue" {
+        return LuaType::Variadic(Box::new(LuaType::Any));
+    }
+
     match qualified_name {
-        "String" => LuaType::String,
+        "String" | "BString" | "LuaString" => LuaType::String,
         "str" => LuaType::String,
         "Integer" => LuaType::Integer,
         "i8" | "i16" | "i32" | "i64" | "i128" | "isize" => LuaType::Integer,
@@ -5832,11 +5853,12 @@ fn lua_type_from_extracted_name(name: &str) -> LuaType {
         "f32" | "f64" => LuaType::Number,
         "Boolean" => LuaType::Boolean,
         "bool" => LuaType::Boolean,
-        "Table" => LuaType::Table,
-        "Value" => LuaType::Any,
-        "Function" => LuaType::Function,
-        "AnyUserData" => LuaType::Any,
-        "Thread" => LuaType::Thread,
+        "Table" | "LuaTable" => LuaType::Table,
+        "Value" | "LuaValue" => LuaType::Any,
+        "Function" | "LuaFunction" => LuaType::Function,
+        "AnyUserData" | "LuaAnyUserData" => LuaType::Any,
+        "Thread" | "LuaThread" => LuaType::Thread,
+        "()" => LuaType::Nil,
         _ => LuaType::Class(qualified_name.to_string()),
     }
 }
@@ -6395,16 +6417,22 @@ fn map_ty_to_lua<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> LuaType {
                     fallback
                 } else {
                     let name = path.rsplit("::").next().unwrap_or_default();
-                    let has_informative_args = type_args.iter().any(|a| !matches!(a, LuaType::Any));
-                    if has_informative_args {
-                        let args = type_args
-                            .iter()
-                            .map(|a| a.to_string())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        LuaType::Class(format!("{name}<{args}>"))
+                    // Opaque types (impl Trait) resolve to {opaque#N} — fall back to any
+                    if name.starts_with('{') || path.contains("{opaque") {
+                        LuaType::Any
                     } else {
-                        LuaType::Class(name.to_string())
+                        let has_informative_args =
+                            type_args.iter().any(|a| !matches!(a, LuaType::Any));
+                        if has_informative_args {
+                            let args = type_args
+                                .iter()
+                                .map(|a| a.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            LuaType::Class(format!("{name}<{args}>"))
+                        } else {
+                            LuaType::Class(name.to_string())
+                        }
                     }
                 }
             }
@@ -6412,6 +6440,13 @@ fn map_ty_to_lua<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> LuaType {
 
         _ => LuaType::Any,
     }
+}
+
+/// Returns true if the type is an error class that leaked through Result unwrapping.
+/// In Lua, errors are thrown (not returned), so these should be stripped from returns.
+fn is_error_class(ty: &LuaType) -> bool {
+    matches!(ty, LuaType::Class(name) if name == "Error" || name == "LuaError"
+        || name.ends_with("::Error") || name.ends_with("::LuaError"))
 }
 
 /// Map a return type to a list of Lua return values.
@@ -6430,12 +6465,13 @@ fn map_return_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> Vec<LuaReturn> {
         ty::TyKind::Tuple(fields) => fields
             .iter()
             .map(|t| LuaReturn::from(map_ty_to_lua(tcx, t)))
+            .filter(|r| !is_error_class(&r.ty))
             .collect(),
 
         // Single return value
         _ => {
             let lua_ty = map_ty_to_lua(tcx, ty);
-            if lua_ty == LuaType::Nil {
+            if lua_ty == LuaType::Nil || is_error_class(&lua_ty) {
                 Vec::new()
             } else {
                 vec![lua_ty.into()]
@@ -6446,15 +6482,28 @@ fn map_return_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> Vec<LuaReturn> {
 
 /// Unwrap Result<T, _> to get T. If not a Result, returns the type unchanged.
 fn unwrap_result_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> ty::Ty<'tcx> {
-    if let ty::TyKind::Adt(adt_def, args) = ty.kind() {
-        let path = tcx.def_path_str(adt_def.did());
-        if (path == "std::result::Result" || path == "core::result::Result")
-            && let Some(inner) = args.types().next()
-        {
-            return inner;
+    match ty.kind() {
+        ty::TyKind::Adt(adt_def, args) => {
+            let path = tcx.def_path_str(adt_def.did());
+            if (path == "std::result::Result" || path == "core::result::Result")
+                && let Some(inner) = args.types().next()
+            {
+                return inner;
+            }
+            ty
         }
+        // Type aliases like anyhow::Result<T> resolve through Alias
+        ty::TyKind::Alias(_, alias) => {
+            let instantiated = tcx.type_of(alias.def_id).instantiate(tcx, alias.args);
+            let unwrapped = unwrap_result_ty(tcx, instantiated);
+            if unwrapped != instantiated {
+                unwrapped
+            } else {
+                ty
+            }
+        }
+        _ => ty,
     }
-    ty
 }
 
 /// Unwrap a Coroutine type (from async closures) to find the Result<T, E> return type.
@@ -6517,6 +6566,7 @@ fn is_informative(ty: &LuaType) -> bool {
         LuaType::Any | LuaType::Nil | LuaType::Function => false,
         LuaType::Optional(inner) => is_informative(inner),
         LuaType::Variadic(inner) => is_informative(inner),
+        LuaType::Class(name) if name.contains("{opaque") || name.starts_with('{') => false,
         _ => true,
     }
 }
