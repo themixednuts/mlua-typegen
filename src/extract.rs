@@ -1205,14 +1205,35 @@ fn extract_event_arg_types<'tcx>(tcx: TyCtxt<'tcx>, expr: &'tcx hir::Expr<'tcx>)
         }
     }
 
-    // Fallback: use typeck on the expression
+    // Inline tuple expression: (arg1, arg2, ...) — extract each element's type
+    if let hir::ExprKind::Tup(fields) = &expr.kind {
+        if fields.is_empty() {
+            return vec![];
+        }
+        let typeck = tcx.typeck(expr.hir_id.owner.def_id);
+        return fields
+            .iter()
+            .map(|f| {
+                let ty = typeck.node_type(f.hir_id);
+                map_ty_to_lua(tcx, ty)
+            })
+            .collect();
+    }
+
+    // Fallback: use typeck on the expression — decompose tuple types
     let typeck = tcx.typeck(expr.hir_id.owner.def_id);
     let ty = typeck.node_type(expr.hir_id);
-    let lua_ty = map_ty_to_lua(tcx, ty);
-    if matches!(lua_ty, LuaType::Any | LuaType::Nil) {
-        vec![]
-    } else {
-        vec![lua_ty]
+    match ty.kind() {
+        ty::TyKind::Tuple(fields) if fields.is_empty() => vec![],
+        ty::TyKind::Tuple(fields) => fields.iter().map(|t| map_ty_to_lua(tcx, t)).collect(),
+        _ => {
+            let lua_ty = map_ty_to_lua(tcx, ty);
+            if matches!(lua_ty, LuaType::Any | LuaType::Nil) {
+                vec![]
+            } else {
+                vec![lua_ty]
+            }
+        }
     }
 }
 
