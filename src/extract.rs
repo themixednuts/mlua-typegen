@@ -3050,6 +3050,16 @@ fn peel_try_expr<'tcx>(mut expr: &'tcx hir::Expr<'tcx>) -> &'tcx hir::Expr<'tcx>
     }
 }
 
+/// Peel `.to_dynamic()` method calls to get the original typed receiver.
+fn peel_to_dynamic<'tcx>(expr: &'tcx hir::Expr<'tcx>) -> &'tcx hir::Expr<'tcx> {
+    if let hir::ExprKind::MethodCall(segment, receiver, _, _) = &expr.kind
+        && segment.ident.name.as_str() == "to_dynamic"
+    {
+        return receiver;
+    }
+    expr
+}
+
 fn peel_lua_conversion_expr<'tcx>(mut expr: &'tcx hir::Expr<'tcx>) -> &'tcx hir::Expr<'tcx> {
     loop {
         expr = peel_try_expr(expr);
@@ -7825,14 +7835,18 @@ fn infer_returns_from_expr<'tcx>(
                 if matches!(name, Some("Ok" | "Some")) && args.len() == 1 {
                     return infer_returns_from_expr(tcx, &args[0]);
                 }
-                // to_lua(lua, data) / from_lua_value_dynamic(data) → infer from data arg
+                // to_lua / dynamic_to_lua_value / to_dynamic → infer from data arg
                 if matches!(
                     name,
-                    Some("to_lua" | "to_dynamic" | "from_lua_value_dynamic")
+                    Some(
+                        "to_lua" | "to_dynamic" | "from_lua_value_dynamic" | "dynamic_to_lua_value"
+                    )
                 ) && !args.is_empty()
                 {
-                    // Last arg is typically the data (first might be lua context)
+                    // Last arg is the data (first might be lua context)
                     let data_arg = args.last().unwrap();
+                    // Peel .to_dynamic() to get the original typed value
+                    let data_arg = peel_to_dynamic(data_arg);
                     let typeck = tcx.typeck(data_arg.hir_id.owner.def_id);
                     let ty = typeck.node_type(data_arg.hir_id);
                     let lua_ty = map_ty_to_lua(tcx, ty);
