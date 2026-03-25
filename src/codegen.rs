@@ -418,7 +418,10 @@ pub fn write_stubs(output_dir: &Path, api: &LuaApi, crate_name: &str) -> std::io
 }
 
 /// Writes stub files to the output directory for a specific language server target.
-/// Each crate gets its own file (`<crate_name>.lua`) so workspace builds don't overwrite.
+///
+/// Modules are written to per-module files (e.g., `wezterm.lua`) so that functions from
+/// multiple crates sharing the same module are merged into a single file. Classes, enums,
+/// and globals from each crate go into `{crate_name}.lua`.
 pub fn write_stubs_for(
     output_dir: &Path,
     api: &LuaApi,
@@ -451,9 +454,76 @@ pub fn write_stubs_for(
         }
     }
 
-    let content = generate_stubs_for(api, target);
-    let filename = format!("{crate_name}.lua");
-    std::fs::write(output_dir.join(filename), content)?;
+    // Write modules to per-module files so cross-crate modules merge naturally.
+    for module in &api.modules {
+        let module_file = output_dir.join(format!("{}.lua", module.name));
+        let mut content = String::new();
+
+        if module_file.exists() {
+            // Append to existing module file — skip the header/class decl,
+            // only add new functions and fields.
+            content = std::fs::read_to_string(&module_file)?;
+            // Strip trailing newlines to append cleanly
+            let trimmed_len = content.trim_end().len();
+            content.truncate(trimmed_len);
+            content.push('\n');
+            content.push('\n');
+
+            // Collect existing function names to avoid duplicates
+            let existing: std::collections::HashSet<String> = content
+                .lines()
+                .filter_map(|line| {
+                    let line = line.trim();
+                    // Match "function module.name(" or "function module:name("
+                    line.strip_prefix("function ")
+                        .and_then(|rest| rest.split('(').next())
+                        .map(String::from)
+                })
+                .collect();
+
+            // Add new fields that aren't already present
+            for field in &module.fields {
+                let field_marker = format!("---@field {} ", field.name);
+                if !content.contains(&field_marker) {
+                    // Insert field annotation before the table assignment line
+                    // For simplicity, just write them at the append point
+                    write_field(&mut content, field);
+                }
+            }
+
+            // Only write functions not already in the file
+            for func in &module.functions {
+                let qualified = format!("{}.{}", module.name, func.name);
+                let qualified_colon = format!("{}:{}", module.name, func.name);
+                if !existing.contains(&qualified) && !existing.contains(&qualified_colon) {
+                    write_namespaced_function(&mut content, &module.name, func, target);
+                }
+            }
+        } else {
+            // First time writing this module — generate full content
+            writeln!(content, "---@meta").unwrap();
+            content.push('\n');
+            write_module(&mut content, module, target);
+        }
+
+        std::fs::write(&module_file, content)?;
+    }
+
+    // Write classes, enums, globals, and global functions to per-crate file
+    let non_module_api = LuaApi {
+        classes: api.classes.clone(),
+        enums: api.enums.clone(),
+        modules: vec![], // modules handled above
+        global_fields: api.global_fields.clone(),
+        global_functions: api.global_functions.clone(),
+    };
+
+    let non_module_content = generate_stubs_for(&non_module_api, target);
+    // Only write the per-crate file if there's actual content beyond ---@meta
+    if non_module_content.trim().len() > "---@meta".len() {
+        let filename = format!("{crate_name}.lua");
+        std::fs::write(output_dir.join(filename), non_module_content)?;
+    }
 
     Ok(())
 }
