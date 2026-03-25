@@ -2668,7 +2668,33 @@ fn extract_named_fn_callback_signature<'tcx>(
     };
 
     let ret_ty = sig.output();
-    let returns = map_return_ty(tcx, ret_ty);
+    let mut returns = map_return_ty(tcx, ret_ty);
+
+    // For async fns, fn_sig returns impl Future which may not resolve.
+    // If returns are empty/uninformative, try the HIR return type annotation.
+    if returns.iter().all(|r| !is_informative(&r.ty))
+        && let Some(local) = def_id.as_local()
+        && let rustc_hir::Node::Item(item) = tcx.hir_node_by_def_id(local)
+        && let hir::ItemKind::Fn { sig: fn_sig, .. } = &item.kind
+        && let hir::FnRetTy::Return(ret_hir_ty) = &fn_sig.decl.output
+        && let Ok(snippet) = tcx.sess.source_map().span_to_snippet(ret_hir_ty.span)
+    {
+        let snippet = snippet.trim();
+        // Unwrap Result<T, _> or mlua::Result<T>
+        let inner = snippet
+            .strip_prefix("mlua::Result<")
+            .or_else(|| snippet.strip_prefix("Result<"))
+            .and_then(|s| s.strip_suffix('>'))
+            .unwrap_or(snippet);
+        if inner == "()" || inner.is_empty() {
+            returns = vec![];
+        } else {
+            let ty = lua_type_from_extracted_name(inner);
+            if is_informative(&ty) {
+                returns = vec![ty.into()];
+            }
+        }
+    }
 
     Some((params, returns))
 }
@@ -6860,6 +6886,8 @@ fn is_error_class(ty: &LuaType) -> bool {
 fn map_return_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> Vec<LuaReturn> {
     // Unwrap Coroutine (async closures) to get the actual return type
     let ty = unwrap_coroutine_ty(tcx, ty);
+    // Unwrap impl Future<Output = T> from async fn signatures
+    let ty = unwrap_future_output(tcx, ty);
     // Then unwrap Result<T, _> → T
     let ty = unwrap_result_ty(tcx, ty);
 
@@ -6887,6 +6915,28 @@ fn map_return_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> Vec<LuaReturn> {
 }
 
 /// Unwrap Result<T, _> to get T. If not a Result, returns the type unchanged.
+/// Unwrap `impl Future<Output = T>` from async fn signatures.
+/// The opaque type from `fn_sig` resolves through its bounds to find the Output projection.
+fn unwrap_future_output<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> ty::Ty<'tcx> {
+    if let ty::TyKind::Alias(_, alias) = ty.kind()
+        && matches!(
+            tcx.def_kind(alias.def_id),
+            rustc_hir::def::DefKind::OpaqueTy
+        )
+    {
+        let bounds = tcx.explicit_item_bounds(alias.def_id);
+        for (bound, _) in bounds.skip_binder() {
+            if let ty::ClauseKind::Projection(proj) = bound.kind().skip_binder()
+                && tcx.item_name(proj.projection_term.def_id).as_str() == "Output"
+                && let Some(output_ty) = proj.term.as_type()
+            {
+                return ty::EarlyBinder::bind(output_ty).instantiate(tcx, alias.args);
+            }
+        }
+    }
+    ty
+}
+
 fn unwrap_result_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> ty::Ty<'tcx> {
     match ty.kind() {
         ty::TyKind::Adt(adt_def, args) => {
