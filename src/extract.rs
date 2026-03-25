@@ -4620,28 +4620,20 @@ fn infer_sequence_values_item_type<'tcx>(
             if segment.ident.name.as_str() == "sequence_values"
                 && path_tail_name(receiver).as_deref() == Some(binding_name)
             {
-                let args = segment.args?;
-                let hir::GenericArg::Type(ty) = args.args.first()? else {
-                    return snippet_generic_type_name(
-                        &expr_snippet(tcx, expr),
-                        "sequence_values::<",
-                    )
-                    .as_deref()
-                    .map(lua_type_from_extracted_name);
-                };
-                let hir::TyKind::Path(qpath) = &ty.kind else {
-                    return snippet_generic_type_name(
-                        &expr_snippet(tcx, expr),
-                        "sequence_values::<",
-                    )
-                    .as_deref()
-                    .map(lua_type_from_extracted_name);
-                };
-
-                return extract_type_name_from_qpath(qpath)
-                    .or_else(|| {
-                        snippet_generic_type_name(&expr_snippet(tcx, expr), "sequence_values::<")
-                    })
+                // Try HIR generic args first
+                if let Some(args) = segment.args
+                    && let Some(hir::GenericArg::Type(ty)) = args.args.first()
+                    && let Some(lua_ty) = hir_ty_to_lua_type(tcx, ty)
+                    && is_informative(&lua_ty)
+                {
+                    return Some(lua_ty);
+                }
+                // Try typeck-resolved generics
+                if let Some(lua_ty) = typeck_method_generic_type(tcx, expr) {
+                    return Some(lua_ty);
+                }
+                // Final snippet fallback
+                return snippet_generic_type_name(&expr_snippet(tcx, expr), "sequence_values::<")
                     .as_deref()
                     .map(lua_type_from_extracted_name);
             }
@@ -5256,6 +5248,7 @@ fn method_generic_lua_type(
     expr: &hir::Expr<'_>,
     segment: &hir::PathSegment<'_>,
 ) -> Option<LuaType> {
+    // Try explicit generic args from HIR first
     if let Some(args) = segment.args
         && let Some(hir::GenericArg::Type(ty)) = args.args.first()
         && let Some(lua_ty) = lua_type_from_hir_ty_with_snippet(tcx, ty)
@@ -5263,10 +5256,36 @@ fn method_generic_lua_type(
         return Some(lua_ty);
     }
 
+    // Try typeck-resolved generic args (handles inferred generics)
+    if let Some(lua_ty) = typeck_method_generic_type(tcx, expr) {
+        return Some(lua_ty);
+    }
+
+    // Final fallback: parse source snippet for turbofish
     let marker = format!("{}::<", segment.ident.name.as_str());
     snippet_generic_type_name(&expr_snippet(tcx, expr), &marker)
         .as_deref()
         .map(lua_type_from_extracted_name)
+}
+
+/// Resolve the first generic type argument of a method call via typeck.
+/// This handles cases where the turbofish is elided and the compiler infers the type.
+fn typeck_method_generic_type(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> Option<LuaType> {
+    let typeck = tcx.typeck(expr.hir_id.owner.def_id);
+    let args = typeck.node_args(expr.hir_id);
+    // Method calls have Self as first arg, then user-specified type params
+    // Skip Self and receiver-related args, look for the first type that maps informatively
+    for arg in args.iter() {
+        if let Some(ty) = arg.as_type() {
+            let lua_ty = map_ty_to_lua(tcx, ty);
+            if is_informative(&lua_ty)
+                && !matches!(&lua_ty, LuaType::Class(n) if n.contains("{opaque"))
+            {
+                return Some(lua_ty);
+            }
+        }
+    }
+    None
 }
 
 fn callee_try_from_type_name(tcx: TyCtxt<'_>, callee: &hir::Expr<'_>) -> Option<String> {
@@ -5670,11 +5689,27 @@ fn infer_table_converter_call_type<'tcx>(
 
     if callee_name.as_deref() == Some("table_to_args") {
         let key_ty = make_union(vec![LuaType::Integer, LuaType::String]);
-        let value_ty = match snippet
-            .as_deref()
-            .map(infer_value_converter_types_from_snippet)
-            .filter(|tys| !tys.is_empty())
-        {
+        // Try HIR-based inference first, fall back to snippet
+        let hir_types = expr_def_id(tcx, callee)
+            .and_then(|did| did.as_local())
+            .and_then(|local| {
+                let node = tcx.hir_node_by_def_id(local);
+                if let rustc_hir::Node::Item(item) = node
+                    && let hir::ItemKind::Fn { body, .. } = &item.kind
+                {
+                    let body = tcx.hir_body(*body);
+                    let tys = infer_value_converter_types_from_hir(tcx, body.value);
+                    (!tys.is_empty()).then_some(tys)
+                } else {
+                    None
+                }
+            });
+        let value_ty = match hir_types.or_else(|| {
+            snippet
+                .as_deref()
+                .map(infer_value_converter_types_from_snippet)
+                .filter(|tys| !tys.is_empty())
+        }) {
             Some(tys) => make_union(normalize_table_value_types(tys)),
             None => json_like_lua_type(),
         };
@@ -6358,6 +6393,139 @@ fn infer_param_type_from_converter_call<'tcx>(
     }
 }
 
+/// HIR-based converter type inference: walk a function body for Value variant patterns,
+/// TypeId::of::<T>() calls, and borrow::<T>() method calls.
+fn infer_value_converter_types_from_hir<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body_expr: &'tcx hir::Expr<'tcx>,
+) -> Vec<LuaType> {
+    let mut tys = Vec::new();
+    collect_converter_types_from_hir(tcx, body_expr, &mut tys);
+    tys
+}
+
+fn collect_converter_types_from_hir<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+    tys: &mut Vec<LuaType>,
+) {
+    match &expr.kind {
+        // Value::Boolean, Value::String, etc. in match arms
+        hir::ExprKind::Path(qpath) => {
+            if let Some(name) = match qpath {
+                hir::QPath::Resolved(_, path) => {
+                    let segs: Vec<_> = path
+                        .segments
+                        .iter()
+                        .map(|s| s.ident.name.as_str())
+                        .collect();
+                    (segs.len() >= 2 && segs[segs.len() - 2] == "Value")
+                        .then(|| segs.last().copied().unwrap_or_default())
+                }
+                _ => None,
+            } {
+                match name {
+                    "Nil" => tys.push(LuaType::Nil),
+                    "Boolean" => tys.push(LuaType::Boolean),
+                    "Integer" => tys.push(LuaType::Integer),
+                    "Number" => tys.push(LuaType::Number),
+                    "String" => tys.push(LuaType::String),
+                    "Table" => tys.push(LuaType::Table),
+                    "Function" => tys.push(LuaType::Function),
+                    "Thread" => tys.push(LuaType::Thread),
+                    _ => {}
+                }
+            }
+        }
+        // TypeId::of::<T>() / take::<T>() / borrow::<T>() — extract generic type
+        hir::ExprKind::MethodCall(segment, _, _, _) => {
+            let method = segment.ident.name.as_str();
+            if matches!(
+                method,
+                "take" | "borrow" | "borrow_mut" | "try_borrow" | "try_borrow_mut"
+            ) && let Some(lua_ty) = typeck_method_generic_type(tcx, expr)
+                && is_informative(&lua_ty)
+            {
+                tys.push(lua_ty);
+            }
+        }
+        hir::ExprKind::Call(callee, _) => {
+            // TypeId::of::<T>()
+            if let Some(lua_ty) = typeck_call_generic_type(tcx, expr)
+                && is_informative(&lua_ty)
+            {
+                tys.push(lua_ty);
+            }
+            collect_converter_types_from_hir(tcx, callee, tys);
+        }
+        // Recurse into blocks, matches, etc.
+        hir::ExprKind::Block(block, _) => {
+            for stmt in block.stmts {
+                if let hir::StmtKind::Expr(e) | hir::StmtKind::Semi(e) = &stmt.kind {
+                    collect_converter_types_from_hir(tcx, e, tys);
+                }
+                if let hir::StmtKind::Let(local) = &stmt.kind
+                    && let Some(init) = local.init
+                {
+                    collect_converter_types_from_hir(tcx, init, tys);
+                }
+            }
+            if let Some(tail) = block.expr {
+                collect_converter_types_from_hir(tcx, tail, tys);
+            }
+        }
+        hir::ExprKind::Match(scrutinee, arms, _) => {
+            collect_converter_types_from_hir(tcx, scrutinee, tys);
+            for arm in *arms {
+                // Check arm patterns for Value::Variant
+                collect_value_variants_from_pat(arm.pat, tys);
+                collect_converter_types_from_hir(tcx, arm.body, tys);
+            }
+        }
+        hir::ExprKind::If(cond, then_expr, else_expr) => {
+            collect_converter_types_from_hir(tcx, cond, tys);
+            collect_converter_types_from_hir(tcx, then_expr, tys);
+            if let Some(e) = else_expr {
+                collect_converter_types_from_hir(tcx, e, tys);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Extract Value::Variant names from match arm patterns.
+fn collect_value_variants_from_pat(pat: &hir::Pat<'_>, tys: &mut Vec<LuaType>) {
+    match &pat.kind {
+        hir::PatKind::TupleStruct(qpath, _, _) | hir::PatKind::Struct(qpath, _, _) => {
+            if let hir::QPath::Resolved(_, path) = qpath {
+                let segs: Vec<_> = path
+                    .segments
+                    .iter()
+                    .map(|s| s.ident.name.as_str())
+                    .collect();
+                if segs.len() >= 2 && segs[segs.len() - 2] == "Value" {
+                    match *segs.last().unwrap_or(&"") {
+                        "Boolean" => tys.push(LuaType::Boolean),
+                        "Integer" => tys.push(LuaType::Integer),
+                        "Number" => tys.push(LuaType::Number),
+                        "String" => tys.push(LuaType::String),
+                        "Table" => tys.push(LuaType::Table),
+                        "Function" => tys.push(LuaType::Function),
+                        "Thread" => tys.push(LuaType::Thread),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        hir::PatKind::Or(pats) => {
+            for p in *pats {
+                collect_value_variants_from_pat(p, tys);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn infer_value_converter_types_from_snippet(snippet: &str) -> Vec<LuaType> {
     let mut tys = Vec::new();
 
@@ -6434,8 +6602,9 @@ fn extract_type_id_guard_lua_type(
 fn extract_type_id_of_lua_type(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> Option<LuaType> {
     let expr = peel_try_expr(expr);
     let hir::ExprKind::Call(callee, _) = &expr.kind else {
-        return snippet_generic_type_name(&expr_snippet(tcx, expr), "TypeId::of::<")
-            .map(LuaType::Class);
+        return typeck_call_generic_type(tcx, expr).or_else(|| {
+            snippet_generic_type_name(&expr_snippet(tcx, expr), "TypeId::of::<").map(LuaType::Class)
+        });
     };
     let args = match &callee.kind {
         hir::ExprKind::Path(hir::QPath::TypeRelative(_, seg))
@@ -6453,17 +6622,32 @@ fn extract_type_id_of_lua_type(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> Option<
         _ => return None,
     };
 
-    let hir::GenericArg::Type(ty) = args.args.first()? else {
-        return snippet_generic_type_name(&expr_snippet(tcx, expr), "TypeId::of::<")
-            .map(LuaType::Class);
-    };
+    if let Some(hir::GenericArg::Type(ty)) = args.args.first()
+        && let Some(lua_ty) = hir_ty_to_lua_type(tcx, ty)
+        && is_informative(&lua_ty)
+    {
+        return Some(lua_ty);
+    }
 
-    let hir::TyKind::Path(qpath) = &ty.kind else {
-        return snippet_generic_type_name(&expr_snippet(tcx, expr), "TypeId::of::<")
-            .map(LuaType::Class);
-    };
+    // Fallback: typeck or snippet
+    typeck_call_generic_type(tcx, expr).or_else(|| {
+        snippet_generic_type_name(&expr_snippet(tcx, expr), "TypeId::of::<").map(LuaType::Class)
+    })
+}
 
-    Some(LuaType::Class(extract_type_name_from_qpath(qpath)?))
+/// Resolve the first generic type argument of a function call via typeck.
+fn typeck_call_generic_type(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> Option<LuaType> {
+    let typeck = tcx.typeck(expr.hir_id.owner.def_id);
+    let args = typeck.node_args(expr.hir_id);
+    for arg in args.iter() {
+        if let Some(ty) = arg.as_type() {
+            let lua_ty = map_ty_to_lua(tcx, ty);
+            if is_informative(&lua_ty) {
+                return Some(lua_ty);
+            }
+        }
+    }
+    None
 }
 
 fn lua_type_from_extracted_name(name: &str) -> LuaType {
