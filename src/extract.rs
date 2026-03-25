@@ -7747,6 +7747,17 @@ fn infer_returns_from_expr<'tcx>(
             match segment.ident.name.as_str() {
                 "into_lua_multi" => Some(infer_into_lua_multi_returns(tcx, receiver)),
                 "into_lua" => Some(vec![infer_value_expr_lua_type(tcx, receiver).into()]),
+                // lua.to_value(&data) → infer type from the data argument
+                "to_value" | "to_value_with" if !args.is_empty() => {
+                    let typeck = tcx.typeck(args[0].hir_id.owner.def_id);
+                    let ty = typeck.node_type(args[0].hir_id);
+                    let lua_ty = map_ty_to_lua(tcx, ty);
+                    if is_informative(&lua_ty) {
+                        Some(vec![lua_ty.into()])
+                    } else {
+                        None
+                    }
+                }
                 _ if infer_forwarded_multivalue_returns(tcx, expr, segment, args).is_some() => {
                     infer_forwarded_multivalue_returns(tcx, expr, segment, args)
                 }
@@ -7763,6 +7774,21 @@ fn infer_returns_from_expr<'tcx>(
                 };
                 if matches!(name, Some("Ok" | "Some")) && args.len() == 1 {
                     return infer_returns_from_expr(tcx, &args[0]);
+                }
+                // to_lua(lua, data) / from_lua_value_dynamic(data) → infer from data arg
+                if matches!(
+                    name,
+                    Some("to_lua" | "to_dynamic" | "from_lua_value_dynamic")
+                ) && !args.is_empty()
+                {
+                    // Last arg is typically the data (first might be lua context)
+                    let data_arg = args.last().unwrap();
+                    let typeck = tcx.typeck(data_arg.hir_id.owner.def_id);
+                    let ty = typeck.node_type(data_arg.hir_id);
+                    let lua_ty = map_ty_to_lua(tcx, ty);
+                    if is_informative(&lua_ty) {
+                        return Some(vec![lua_ty.into()]);
+                    }
                 }
             }
             None
@@ -7834,6 +7860,21 @@ fn infer_returns_from_expr<'tcx>(
             infer_returns_from_expr(tcx, body.value)
         }
         hir::ExprKind::Ret(Some(expr)) => infer_returns_from_expr(tcx, expr),
+        // Resolve local variable references to their initializer
+        hir::ExprKind::Path(hir::QPath::Resolved(_, path))
+            if matches!(path.res, rustc_hir::def::Res::Local(_)) =>
+        {
+            if let rustc_hir::def::Res::Local(hir_id) = path.res
+                && let rustc_hir::Node::Pat(pat) = tcx.hir_node(hir_id)
+                && let rustc_hir::Node::LetStmt(local) = tcx.hir_node(tcx.parent_hir_id(pat.hir_id))
+                && let Some(init) = local.init
+            {
+                let init = peel_try_expr(init);
+                infer_returns_from_expr(tcx, init)
+            } else {
+                None
+            }
+        }
         _ => {
             let typeck = tcx.typeck(expr.hir_id.owner.def_id);
             infer_from_expr(tcx, typeck, expr).map(|ty| vec![ty.into()])
