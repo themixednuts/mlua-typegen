@@ -1,4 +1,20 @@
-use crate::LuaType;
+use crate::{LuaType, make_union};
+
+/// Formats a class name with generic type arguments when any argument is
+/// informative (i.e. not just `any`). Produces e.g. `Iter<any, Url>`.
+fn format_class_with_args(name: &str, type_args: &[LuaType]) -> String {
+    let has_informative = type_args.iter().any(|a| !matches!(a, LuaType::Any));
+    if has_informative {
+        let args = type_args
+            .iter()
+            .map(|a| a.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{name}<{args}>")
+    } else {
+        name.to_string()
+    }
+}
 
 /// Maps a fully-qualified Rust type path to a Lua type.
 ///
@@ -12,8 +28,8 @@ pub fn map_rust_type(rust_type: &str, type_args: &[LuaType]) -> LuaType {
         "std::string::String" | "alloc::string::String" | "&str" | "str" => LuaType::String,
 
         // Integer types
-        "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64"
-        | "u128" | "usize" => LuaType::Integer,
+        "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "u8" | "u16" | "u32" | "u64" | "u128"
+        | "usize" => LuaType::Integer,
 
         // Float types
         "f32" | "f64" => LuaType::Number,
@@ -41,8 +57,10 @@ pub fn map_rust_type(rust_type: &str, type_args: &[LuaType]) -> LuaType {
         }
 
         // HashMap<K, V> / BTreeMap<K, V> → table<K, V>
-        "std::collections::HashMap" | "std::collections::hash_map::HashMap"
-        | "std::collections::BTreeMap" | "std::collections::btree_map::BTreeMap" => {
+        "std::collections::HashMap"
+        | "std::collections::hash_map::HashMap"
+        | "std::collections::BTreeMap"
+        | "std::collections::btree_map::BTreeMap" => {
             let k = type_args.first().cloned().unwrap_or(LuaType::Any);
             let v = type_args.get(1).cloned().unwrap_or(LuaType::Any);
             LuaType::Map(Box::new(k), Box::new(v))
@@ -54,38 +72,36 @@ pub fn map_rust_type(rust_type: &str, type_args: &[LuaType]) -> LuaType {
         }
 
         // Box<T>, Arc<T>, Rc<T> → unwrap to T
-        "std::boxed::Box" | "alloc::boxed::Box"
-        | "std::sync::Arc" | "alloc::sync::Arc"
-        | "std::rc::Rc" | "alloc::rc::Rc" => {
-            type_args.first().cloned().unwrap_or(LuaType::Any)
-        }
+        "std::boxed::Box" | "alloc::boxed::Box" | "std::sync::Arc" | "alloc::sync::Arc"
+        | "std::rc::Rc" | "alloc::rc::Rc" => type_args.first().cloned().unwrap_or(LuaType::Any),
 
         // Mutex<T>, RwLock<T> → unwrap to T (lock wrappers transparent to Lua)
-        "std::sync::Mutex" | "std::sync::RwLock"
-        | "std::sync::MutexGuard" | "std::sync::RwLockReadGuard"
+        "std::sync::Mutex"
+        | "std::sync::RwLock"
+        | "std::sync::MutexGuard"
+        | "std::sync::RwLockReadGuard"
         | "std::sync::RwLockWriteGuard"
-        | "parking_lot::Mutex" | "parking_lot::RwLock"
-        | "parking_lot::MutexGuard" | "parking_lot::RwLockReadGuard"
+        | "parking_lot::Mutex"
+        | "parking_lot::RwLock"
+        | "parking_lot::MutexGuard"
+        | "parking_lot::RwLockReadGuard"
         | "parking_lot::RwLockWriteGuard"
-        | "tokio::sync::Mutex" | "tokio::sync::RwLock"
-        | "tokio::sync::MutexGuard" | "tokio::sync::RwLockReadGuard"
-        | "tokio::sync::RwLockWriteGuard" => {
-            type_args.first().cloned().unwrap_or(LuaType::Any)
-        }
+        | "tokio::sync::Mutex"
+        | "tokio::sync::RwLock"
+        | "tokio::sync::MutexGuard"
+        | "tokio::sync::RwLockReadGuard"
+        | "tokio::sync::RwLockWriteGuard" => type_args.first().cloned().unwrap_or(LuaType::Any),
 
         // Cell/RefCell → unwrap to T
-        "std::cell::Cell" | "std::cell::RefCell"
-        | "std::cell::Ref" | "std::cell::RefMut" => {
+        "std::cell::Cell" | "std::cell::RefCell" | "std::cell::Ref" | "std::cell::RefMut" => {
             type_args.first().cloned().unwrap_or(LuaType::Any)
         }
 
         // Path types → string
-        "std::path::PathBuf" | "alloc::path::PathBuf"
-        | "std::path::Path" => LuaType::String,
+        "std::path::PathBuf" | "alloc::path::PathBuf" | "std::path::Path" => LuaType::String,
 
         // OsString/OsStr/CString/CStr → string
-        "std::ffi::OsString" | "std::ffi::OsStr"
-        | "std::ffi::CString" | "std::ffi::CStr"
+        "std::ffi::OsString" | "std::ffi::OsStr" | "std::ffi::CString" | "std::ffi::CStr"
         | "core::ffi::CStr" => LuaType::String,
 
         // Cow<T> generic → unwrap to T (Cow<str> already handled above as string)
@@ -94,111 +110,142 @@ pub fn map_rust_type(rust_type: &str, type_args: &[LuaType]) -> LuaType {
         }
 
         // Set types → T[] (Lua has no native set, array is closest)
-        "std::collections::HashSet" | "std::collections::hash_set::HashSet"
-        | "std::collections::BTreeSet" | "std::collections::btree_set::BTreeSet" => {
+        "std::collections::HashSet"
+        | "std::collections::hash_set::HashSet"
+        | "std::collections::BTreeSet"
+        | "std::collections::btree_set::BTreeSet" => {
             let inner = type_args.first().cloned().unwrap_or(LuaType::Any);
             LuaType::Array(Box::new(inner))
         }
 
         // Other sequential containers → T[]
-        "std::collections::VecDeque" | "std::collections::vec_deque::VecDeque"
-        | "std::collections::LinkedList" | "std::collections::linked_list::LinkedList" => {
+        "std::collections::VecDeque"
+        | "std::collections::vec_deque::VecDeque"
+        | "std::collections::LinkedList"
+        | "std::collections::linked_list::LinkedList" => {
             let inner = type_args.first().cloned().unwrap_or(LuaType::Any);
             LuaType::Array(Box::new(inner))
         }
 
         // NonZero integer types → integer
-        "std::num::NonZeroI8" | "std::num::NonZeroI16" | "std::num::NonZeroI32"
-        | "std::num::NonZeroI64" | "std::num::NonZeroI128" | "std::num::NonZeroIsize"
-        | "std::num::NonZeroU8" | "std::num::NonZeroU16" | "std::num::NonZeroU32"
-        | "std::num::NonZeroU64" | "std::num::NonZeroU128" | "std::num::NonZeroUsize"
-        | "core::num::NonZeroI8" | "core::num::NonZeroI16" | "core::num::NonZeroI32"
-        | "core::num::NonZeroI64" | "core::num::NonZeroI128" | "core::num::NonZeroIsize"
-        | "core::num::NonZeroU8" | "core::num::NonZeroU16" | "core::num::NonZeroU32"
-        | "core::num::NonZeroU64" | "core::num::NonZeroU128" | "core::num::NonZeroUsize" => {
-            LuaType::Integer
-        }
+        "std::num::NonZeroI8"
+        | "std::num::NonZeroI16"
+        | "std::num::NonZeroI32"
+        | "std::num::NonZeroI64"
+        | "std::num::NonZeroI128"
+        | "std::num::NonZeroIsize"
+        | "std::num::NonZeroU8"
+        | "std::num::NonZeroU16"
+        | "std::num::NonZeroU32"
+        | "std::num::NonZeroU64"
+        | "std::num::NonZeroU128"
+        | "std::num::NonZeroUsize"
+        | "core::num::NonZeroI8"
+        | "core::num::NonZeroI16"
+        | "core::num::NonZeroI32"
+        | "core::num::NonZeroI64"
+        | "core::num::NonZeroI128"
+        | "core::num::NonZeroIsize"
+        | "core::num::NonZeroU8"
+        | "core::num::NonZeroU16"
+        | "core::num::NonZeroU32"
+        | "core::num::NonZeroU64"
+        | "core::num::NonZeroU128"
+        | "core::num::NonZeroUsize" => LuaType::Integer,
 
         // Pin<T> → unwrap to T
-        "std::pin::Pin" | "core::pin::Pin" => {
-            type_args.first().cloned().unwrap_or(LuaType::Any)
-        }
+        "std::pin::Pin" | "core::pin::Pin" => type_args.first().cloned().unwrap_or(LuaType::Any),
 
         // MaybeUninit<T>, ManuallyDrop<T> → unwrap to T
-        "std::mem::MaybeUninit" | "core::mem::MaybeUninit"
-        | "std::mem::ManuallyDrop" | "core::mem::ManuallyDrop" => {
-            type_args.first().cloned().unwrap_or(LuaType::Any)
-        }
+        "std::mem::MaybeUninit"
+        | "core::mem::MaybeUninit"
+        | "std::mem::ManuallyDrop"
+        | "core::mem::ManuallyDrop" => type_args.first().cloned().unwrap_or(LuaType::Any),
 
         // OnceCell/OnceLock/LazyLock/LazyCell → unwrap to T
-        "std::cell::OnceCell" | "std::sync::OnceLock"
-        | "std::sync::LazyLock" | "std::cell::LazyCell" => {
-            type_args.first().cloned().unwrap_or(LuaType::Any)
-        }
+        "std::cell::OnceCell"
+        | "std::sync::OnceLock"
+        | "std::sync::LazyLock"
+        | "std::cell::LazyCell" => type_args.first().cloned().unwrap_or(LuaType::Any),
 
         // once_cell crate
-        "once_cell::sync::OnceCell" | "once_cell::sync::Lazy"
-        | "once_cell::unsync::OnceCell" | "once_cell::unsync::Lazy" => {
-            type_args.first().cloned().unwrap_or(LuaType::Any)
-        }
+        "once_cell::sync::OnceCell"
+        | "once_cell::sync::Lazy"
+        | "once_cell::unsync::OnceCell"
+        | "once_cell::unsync::Lazy" => type_args.first().cloned().unwrap_or(LuaType::Any),
 
         // Wrapping<T>/Saturating<T> → integer
-        "std::num::Wrapping" | "core::num::Wrapping"
-        | "std::num::Saturating" | "core::num::Saturating" => LuaType::Integer,
+        "std::num::Wrapping"
+        | "core::num::Wrapping"
+        | "std::num::Saturating"
+        | "core::num::Saturating" => LuaType::Integer,
 
         // Atomic types → integer or boolean
         "std::sync::atomic::AtomicBool" | "core::sync::atomic::AtomicBool" => LuaType::Boolean,
-        "std::sync::atomic::AtomicI8" | "std::sync::atomic::AtomicI16"
-        | "std::sync::atomic::AtomicI32" | "std::sync::atomic::AtomicI64"
+        "std::sync::atomic::AtomicI8"
+        | "std::sync::atomic::AtomicI16"
+        | "std::sync::atomic::AtomicI32"
+        | "std::sync::atomic::AtomicI64"
         | "std::sync::atomic::AtomicIsize"
-        | "std::sync::atomic::AtomicU8" | "std::sync::atomic::AtomicU16"
-        | "std::sync::atomic::AtomicU32" | "std::sync::atomic::AtomicU64"
+        | "std::sync::atomic::AtomicU8"
+        | "std::sync::atomic::AtomicU16"
+        | "std::sync::atomic::AtomicU32"
+        | "std::sync::atomic::AtomicU64"
         | "std::sync::atomic::AtomicUsize"
-        | "core::sync::atomic::AtomicI8" | "core::sync::atomic::AtomicI16"
-        | "core::sync::atomic::AtomicI32" | "core::sync::atomic::AtomicI64"
+        | "core::sync::atomic::AtomicI8"
+        | "core::sync::atomic::AtomicI16"
+        | "core::sync::atomic::AtomicI32"
+        | "core::sync::atomic::AtomicI64"
         | "core::sync::atomic::AtomicIsize"
-        | "core::sync::atomic::AtomicU8" | "core::sync::atomic::AtomicU16"
-        | "core::sync::atomic::AtomicU32" | "core::sync::atomic::AtomicU64"
+        | "core::sync::atomic::AtomicU8"
+        | "core::sync::atomic::AtomicU16"
+        | "core::sync::atomic::AtomicU32"
+        | "core::sync::atomic::AtomicU64"
         | "core::sync::atomic::AtomicUsize" => LuaType::Integer,
 
         // mlua types
-        "mlua::table::Table" | "mlua::Table"
-        | "mlua::prelude::LuaTable" => LuaType::Table,
+        "mlua::table::Table" | "mlua::Table" | "mlua::prelude::LuaTable" => LuaType::Table,
 
-        "mlua::function::Function" | "mlua::Function"
-        | "mlua::prelude::LuaFunction" => LuaType::Function,
+        "mlua::function::Function" | "mlua::Function" | "mlua::prelude::LuaFunction" => {
+            LuaType::Function
+        }
 
-        "mlua::value::Value" | "mlua::Value"
-        | "mlua::prelude::LuaValue" => LuaType::Any,
+        "mlua::value::Value" | "mlua::Value" | "mlua::prelude::LuaValue" => LuaType::Any,
 
-        "mlua::string::String" | "mlua::String" | "mlua::BString"
-        | "mlua::prelude::LuaString" => LuaType::String,
+        "mlua::string::String" | "mlua::String" | "mlua::BString" | "mlua::prelude::LuaString" => {
+            LuaType::String
+        }
 
-        "mlua::thread::Thread" | "mlua::Thread"
-        | "mlua::prelude::LuaThread" => LuaType::Thread,
+        "mlua::thread::Thread" | "mlua::Thread" | "mlua::prelude::LuaThread" => LuaType::Thread,
 
-        "mlua::types::Integer" | "mlua::Integer"
-        | "mlua::prelude::LuaInteger" => LuaType::Integer,
+        "mlua::types::Integer" | "mlua::Integer" | "mlua::prelude::LuaInteger" => LuaType::Integer,
 
-        "mlua::types::Number" | "mlua::Number"
-        | "mlua::prelude::LuaNumber" => LuaType::Number,
+        "mlua::types::Number" | "mlua::Number" | "mlua::prelude::LuaNumber" => LuaType::Number,
 
-        "mlua::types::LightUserData" | "mlua::LightUserData"
+        "mlua::types::LightUserData"
+        | "mlua::LightUserData"
         | "mlua::prelude::LuaLightUserData" => LuaType::Any,
 
-        "mlua::userdata::AnyUserData" | "mlua::AnyUserData"
-        | "mlua::prelude::LuaAnyUserData" => LuaType::Any,
+        "mlua::userdata::AnyUserData" | "mlua::AnyUserData" | "mlua::prelude::LuaAnyUserData" => {
+            LuaType::Any
+        }
 
-        "mlua::multi::MultiValue" | "mlua::MultiValue"
-        | "mlua::prelude::LuaMultiValue" => LuaType::Any,
+        "mlua::userdata::UserDataRef"
+        | "mlua::UserDataRef"
+        | "mlua::prelude::LuaUserDataRef"
+        | "mlua::userdata::UserDataRefMut"
+        | "mlua::UserDataRefMut"
+        | "mlua::prelude::LuaUserDataRefMut" => type_args.first().cloned().unwrap_or(LuaType::Any),
+
+        "mlua::multi::MultiValue" | "mlua::MultiValue" | "mlua::prelude::LuaMultiValue" => {
+            LuaType::Variadic(Box::new(LuaType::Any))
+        }
 
         // mlua::Error → string (Lua errors are strings)
-        "mlua::error::Error" | "mlua::Error"
-        | "mlua::prelude::LuaError" => LuaType::String,
+        "mlua::error::Error" | "mlua::Error" | "mlua::prelude::LuaError" => LuaType::String,
 
         // Variadic<T> → T...
-        "mlua::types::Variadic" | "mlua::Variadic"
-        | "mlua::prelude::LuaVariadic" => {
+        "mlua::types::Variadic" | "mlua::Variadic" | "mlua::prelude::LuaVariadic" => {
             let inner = type_args.first().cloned().unwrap_or(LuaType::Any);
             LuaType::Variadic(Box::new(inner))
         }
@@ -206,19 +253,25 @@ pub fn map_rust_type(rust_type: &str, type_args: &[LuaType]) -> LuaType {
         // ── Popular crate types ─────────────────────────────────────────
 
         // bytes crate
-        "bytes::Bytes" | "bytes::BytesMut"
-        | "bytes::bytes::Bytes" | "bytes::bytes_mut::BytesMut" => LuaType::String,
+        "bytes::Bytes"
+        | "bytes::BytesMut"
+        | "bytes::bytes::Bytes"
+        | "bytes::bytes_mut::BytesMut" => LuaType::String,
 
         // String crates (compact_str, smol_str, ecow, arcstr, flexstr, kstring)
-        "compact_str::CompactString" | "smol_str::SmolStr"
-        | "ecow::EcoString" | "arcstr::ArcStr"
-        | "flexstr::SharedStr" | "flexstr::LocalStr"
-        | "kstring::KString" | "kstring::KStringRef"
-        | "bstr::BString" | "bstr::BStr" => LuaType::String,
+        "compact_str::CompactString"
+        | "smol_str::SmolStr"
+        | "ecow::EcoString"
+        | "arcstr::ArcStr"
+        | "flexstr::SharedStr"
+        | "flexstr::LocalStr"
+        | "kstring::KString"
+        | "kstring::KStringRef"
+        | "bstr::BString"
+        | "bstr::BStr" => LuaType::String,
 
         // Array/vec crates (arrayvec, smallvec, tinyvec, thin_vec)
-        "arrayvec::ArrayVec" | "smallvec::SmallVec"
-        | "tinyvec::TinyVec" | "tinyvec::ArrayVec"
+        "arrayvec::ArrayVec" | "smallvec::SmallVec" | "tinyvec::TinyVec" | "tinyvec::ArrayVec"
         | "thin_vec::ThinVec" => {
             let inner = type_args.first().cloned().unwrap_or(LuaType::Any);
             LuaType::Array(Box::new(inner))
@@ -247,7 +300,13 @@ pub fn map_rust_type(rust_type: &str, type_args: &[LuaType]) -> LuaType {
         }
 
         // serde_json
-        "serde_json::Value" | "serde_json::value::Value" => LuaType::Any,
+        "serde_json::Value" | "serde_json::value::Value" => make_union(vec![
+            LuaType::Nil,
+            LuaType::Boolean,
+            LuaType::Number,
+            LuaType::String,
+            LuaType::Table,
+        ]),
         "serde_json::Map" | "serde_json::map::Map" => {
             let k = type_args.first().cloned().unwrap_or(LuaType::String);
             let v = type_args.get(1).cloned().unwrap_or(LuaType::Any);
@@ -259,33 +318,32 @@ pub fn map_rust_type(rust_type: &str, type_args: &[LuaType]) -> LuaType {
         "uuid::Uuid" | "url::Url" => LuaType::String,
 
         // chrono / time — datetime as string (ISO 8601)
-        "chrono::NaiveDateTime" | "chrono::NaiveDate" | "chrono::NaiveTime"
+        "chrono::NaiveDateTime"
+        | "chrono::NaiveDate"
+        | "chrono::NaiveTime"
         | "chrono::DateTime" => LuaType::String,
         "chrono::Duration" | "std::time::Duration" | "core::time::Duration" => LuaType::Number,
 
         // rustc-hash (FxHashMap/FxHashSet)
-        "rustc_hash::FxHashMap" | "rustc_hash::map::FxHashMap"
-        | "fxhash::FxHashMap" => {
+        "rustc_hash::FxHashMap" | "rustc_hash::map::FxHashMap" | "fxhash::FxHashMap" => {
             let k = type_args.first().cloned().unwrap_or(LuaType::Any);
             let v = type_args.get(1).cloned().unwrap_or(LuaType::Any);
             LuaType::Map(Box::new(k), Box::new(v))
         }
-        "rustc_hash::FxHashSet" | "rustc_hash::set::FxHashSet"
-        | "fxhash::FxHashSet" => {
+        "rustc_hash::FxHashSet" | "rustc_hash::set::FxHashSet" | "fxhash::FxHashSet" => {
             let inner = type_args.first().cloned().unwrap_or(LuaType::Any);
             LuaType::Array(Box::new(inner))
         }
 
         // arc-swap — ArcSwap<T>, ArcSwapOption<T>, Guard<T>, etc. → unwrap to T
-        "arc_swap::ArcSwap" | "arc_swap::ArcSwapOption"
+        "arc_swap::ArcSwap"
+        | "arc_swap::ArcSwapOption"
         | "arc_swap::ArcSwapAny"
-        | "arc_swap::Guard" | "arc_swap::access::Guard" => {
-            type_args.first().cloned().unwrap_or(LuaType::Any)
-        }
+        | "arc_swap::Guard"
+        | "arc_swap::access::Guard" => type_args.first().cloned().unwrap_or(LuaType::Any),
 
         // left-right — ReadHandle<T> and WriteHandle<T> → unwrap to T
-        "left_right::ReadHandle" | "left_right::WriteHandle"
-        | "left_right::ReadGuard" => {
+        "left_right::ReadHandle" | "left_right::WriteHandle" | "left_right::ReadGuard" => {
             type_args.first().cloned().unwrap_or(LuaType::Any)
         }
 
@@ -315,7 +373,8 @@ fn heuristic_type_match(rust_type: &str, type_args: &[LuaType]) -> LuaType {
     // Types ending in "String" or "Str" with no type args → string
     if type_args.is_empty()
         && (last_segment.ends_with("String") || last_segment.ends_with("Str"))
-        && last_segment != "String" // already handled
+        && last_segment != "String"
+    // already handled
     {
         return LuaType::String;
     }
@@ -338,6 +397,11 @@ fn heuristic_type_match(rust_type: &str, type_args: &[LuaType]) -> LuaType {
         return LuaType::Array(Box::new(type_args[0].clone()));
     }
 
+    // UserDataRef<T>/UserDataRefMut<T> wrappers from mlua or reexports → unwrap
+    if type_args.len() == 1 && matches!(last_segment, "UserDataRef" | "UserDataRefMut") {
+        return type_args[0].clone();
+    }
+
     // Types ending in "Mutex" / "RwLock" / "Lock" / "Guard" with 1 type arg → unwrap
     if type_args.len() == 1
         && (last_segment.ends_with("Mutex")
@@ -348,8 +412,12 @@ fn heuristic_type_match(rust_type: &str, type_args: &[LuaType]) -> LuaType {
         return type_args[0].clone();
     }
 
-    // Default: use last segment as class name
-    LuaType::Class(last_segment.to_string())
+    // Default: use last segment as class name, preserving informative generic args
+    if type_args.is_empty() {
+        LuaType::Class(last_segment.to_string())
+    } else {
+        LuaType::Class(format_class_with_args(last_segment, type_args))
+    }
 }
 
 #[cfg(test)]
@@ -365,7 +433,9 @@ mod tests {
 
     #[test]
     fn all_integer_types() {
-        for ty in ["i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize"] {
+        for ty in [
+            "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize",
+        ] {
             assert_eq!(map_rust_type(ty, &[]), LuaType::Integer, "failed for {ty}");
         }
     }
@@ -432,7 +502,10 @@ mod tests {
     #[test]
     fn hashmap_maps_to_map() {
         assert_eq!(
-            map_rust_type("std::collections::HashMap", &[LuaType::String, LuaType::Integer]),
+            map_rust_type(
+                "std::collections::HashMap",
+                &[LuaType::String, LuaType::Integer]
+            ),
             LuaType::Map(Box::new(LuaType::String), Box::new(LuaType::Integer))
         );
     }
@@ -440,7 +513,10 @@ mod tests {
     #[test]
     fn btreemap_maps_to_map() {
         assert_eq!(
-            map_rust_type("std::collections::BTreeMap", &[LuaType::String, LuaType::Boolean]),
+            map_rust_type(
+                "std::collections::BTreeMap",
+                &[LuaType::String, LuaType::Boolean]
+            ),
             LuaType::Map(Box::new(LuaType::String), Box::new(LuaType::Boolean))
         );
     }
@@ -448,7 +524,10 @@ mod tests {
     #[test]
     fn hashmap_full_path() {
         assert_eq!(
-            map_rust_type("std::collections::hash_map::HashMap", &[LuaType::String, LuaType::Any]),
+            map_rust_type(
+                "std::collections::hash_map::HashMap",
+                &[LuaType::String, LuaType::Any]
+            ),
             LuaType::Map(Box::new(LuaType::String), Box::new(LuaType::Any))
         );
     }
@@ -456,7 +535,10 @@ mod tests {
     #[test]
     fn btreemap_full_path() {
         assert_eq!(
-            map_rust_type("std::collections::btree_map::BTreeMap", &[LuaType::Integer, LuaType::String]),
+            map_rust_type(
+                "std::collections::btree_map::BTreeMap",
+                &[LuaType::Integer, LuaType::String]
+            ),
             LuaType::Map(Box::new(LuaType::Integer), Box::new(LuaType::String))
         );
     }
@@ -492,77 +574,144 @@ mod tests {
 
     #[test]
     fn mlua_table_types() {
-        for ty in ["mlua::table::Table", "mlua::Table", "mlua::prelude::LuaTable"] {
+        for ty in [
+            "mlua::table::Table",
+            "mlua::Table",
+            "mlua::prelude::LuaTable",
+        ] {
             assert_eq!(map_rust_type(ty, &[]), LuaType::Table, "failed for {ty}");
         }
     }
 
     #[test]
     fn mlua_function_types() {
-        for ty in ["mlua::function::Function", "mlua::Function", "mlua::prelude::LuaFunction"] {
+        for ty in [
+            "mlua::function::Function",
+            "mlua::Function",
+            "mlua::prelude::LuaFunction",
+        ] {
             assert_eq!(map_rust_type(ty, &[]), LuaType::Function, "failed for {ty}");
         }
     }
 
     #[test]
     fn mlua_value_types() {
-        for ty in ["mlua::value::Value", "mlua::Value", "mlua::prelude::LuaValue"] {
+        for ty in [
+            "mlua::value::Value",
+            "mlua::Value",
+            "mlua::prelude::LuaValue",
+        ] {
             assert_eq!(map_rust_type(ty, &[]), LuaType::Any, "failed for {ty}");
         }
     }
 
     #[test]
     fn mlua_string_types() {
-        for ty in ["mlua::string::String", "mlua::String", "mlua::BString", "mlua::prelude::LuaString"] {
+        for ty in [
+            "mlua::string::String",
+            "mlua::String",
+            "mlua::BString",
+            "mlua::prelude::LuaString",
+        ] {
             assert_eq!(map_rust_type(ty, &[]), LuaType::String, "failed for {ty}");
         }
     }
 
     #[test]
     fn mlua_thread_types() {
-        for ty in ["mlua::thread::Thread", "mlua::Thread", "mlua::prelude::LuaThread"] {
+        for ty in [
+            "mlua::thread::Thread",
+            "mlua::Thread",
+            "mlua::prelude::LuaThread",
+        ] {
             assert_eq!(map_rust_type(ty, &[]), LuaType::Thread, "failed for {ty}");
         }
     }
 
     #[test]
     fn mlua_integer_types() {
-        for ty in ["mlua::types::Integer", "mlua::Integer", "mlua::prelude::LuaInteger"] {
+        for ty in [
+            "mlua::types::Integer",
+            "mlua::Integer",
+            "mlua::prelude::LuaInteger",
+        ] {
             assert_eq!(map_rust_type(ty, &[]), LuaType::Integer, "failed for {ty}");
         }
     }
 
     #[test]
     fn mlua_number_types() {
-        for ty in ["mlua::types::Number", "mlua::Number", "mlua::prelude::LuaNumber"] {
+        for ty in [
+            "mlua::types::Number",
+            "mlua::Number",
+            "mlua::prelude::LuaNumber",
+        ] {
             assert_eq!(map_rust_type(ty, &[]), LuaType::Number, "failed for {ty}");
         }
     }
 
     #[test]
     fn mlua_lightuserdata_types() {
-        for ty in ["mlua::types::LightUserData", "mlua::LightUserData", "mlua::prelude::LuaLightUserData"] {
+        for ty in [
+            "mlua::types::LightUserData",
+            "mlua::LightUserData",
+            "mlua::prelude::LuaLightUserData",
+        ] {
             assert_eq!(map_rust_type(ty, &[]), LuaType::Any, "failed for {ty}");
         }
     }
 
     #[test]
     fn mlua_anyuserdata_types() {
-        for ty in ["mlua::userdata::AnyUserData", "mlua::AnyUserData", "mlua::prelude::LuaAnyUserData"] {
+        for ty in [
+            "mlua::userdata::AnyUserData",
+            "mlua::AnyUserData",
+            "mlua::prelude::LuaAnyUserData",
+        ] {
             assert_eq!(map_rust_type(ty, &[]), LuaType::Any, "failed for {ty}");
+        }
+    }
+
+    #[test]
+    fn mlua_userdata_ref_types() {
+        for ty in [
+            "mlua::userdata::UserDataRef",
+            "mlua::UserDataRef",
+            "mlua::prelude::LuaUserDataRef",
+            "mlua::userdata::UserDataRefMut",
+            "mlua::UserDataRefMut",
+            "mlua::prelude::LuaUserDataRefMut",
+        ] {
+            assert_eq!(
+                map_rust_type(ty, &[LuaType::Class("File".to_string())]),
+                LuaType::Class("File".to_string()),
+                "failed for {ty}"
+            );
         }
     }
 
     #[test]
     fn mlua_multivalue_types() {
-        for ty in ["mlua::multi::MultiValue", "mlua::MultiValue", "mlua::prelude::LuaMultiValue"] {
-            assert_eq!(map_rust_type(ty, &[]), LuaType::Any, "failed for {ty}");
+        for ty in [
+            "mlua::multi::MultiValue",
+            "mlua::MultiValue",
+            "mlua::prelude::LuaMultiValue",
+        ] {
+            assert_eq!(
+                map_rust_type(ty, &[]),
+                LuaType::Variadic(Box::new(LuaType::Any)),
+                "failed for {ty}"
+            );
         }
     }
 
     #[test]
     fn mlua_variadic_types() {
-        for ty in ["mlua::types::Variadic", "mlua::Variadic", "mlua::prelude::LuaVariadic"] {
+        for ty in [
+            "mlua::types::Variadic",
+            "mlua::Variadic",
+            "mlua::prelude::LuaVariadic",
+        ] {
             assert_eq!(
                 map_rust_type(ty, &[LuaType::String]),
                 LuaType::Variadic(Box::new(LuaType::String)),
@@ -781,11 +930,20 @@ mod tests {
     #[test]
     fn nonzero_types_map_to_integer() {
         for ty in [
-            "std::num::NonZeroU8", "std::num::NonZeroU16", "std::num::NonZeroU32",
-            "std::num::NonZeroU64", "std::num::NonZeroU128", "std::num::NonZeroUsize",
-            "std::num::NonZeroI8", "std::num::NonZeroI16", "std::num::NonZeroI32",
-            "std::num::NonZeroI64", "std::num::NonZeroI128", "std::num::NonZeroIsize",
-            "core::num::NonZeroU32", "core::num::NonZeroI64",
+            "std::num::NonZeroU8",
+            "std::num::NonZeroU16",
+            "std::num::NonZeroU32",
+            "std::num::NonZeroU64",
+            "std::num::NonZeroU128",
+            "std::num::NonZeroUsize",
+            "std::num::NonZeroI8",
+            "std::num::NonZeroI16",
+            "std::num::NonZeroI32",
+            "std::num::NonZeroI64",
+            "std::num::NonZeroI128",
+            "std::num::NonZeroIsize",
+            "core::num::NonZeroU32",
+            "core::num::NonZeroI64",
         ] {
             assert_eq!(map_rust_type(ty, &[]), LuaType::Integer, "failed for {ty}");
         }
@@ -821,10 +979,10 @@ mod tests {
     fn result_of_option() {
         // Result<Option<String>> → unwraps Result → Optional(String)
         assert_eq!(
-            map_rust_type("std::result::Result", &[
-                LuaType::Optional(Box::new(LuaType::String)),
-                LuaType::Any,
-            ]),
+            map_rust_type(
+                "std::result::Result",
+                &[LuaType::Optional(Box::new(LuaType::String)), LuaType::Any,]
+            ),
             LuaType::Optional(Box::new(LuaType::String))
         );
     }
@@ -842,7 +1000,10 @@ mod tests {
     fn box_of_vec() {
         // Box<Vec<i32>> → Box unwraps → Array(Integer)
         assert_eq!(
-            map_rust_type("std::boxed::Box", &[LuaType::Array(Box::new(LuaType::Integer))]),
+            map_rust_type(
+                "std::boxed::Box",
+                &[LuaType::Array(Box::new(LuaType::Integer))]
+            ),
             LuaType::Array(Box::new(LuaType::Integer))
         );
     }
@@ -878,7 +1039,10 @@ mod tests {
     #[test]
     fn vec_of_optional() {
         assert_eq!(
-            map_rust_type("std::vec::Vec", &[LuaType::Optional(Box::new(LuaType::String))]),
+            map_rust_type(
+                "std::vec::Vec",
+                &[LuaType::Optional(Box::new(LuaType::String))]
+            ),
             LuaType::Array(Box::new(LuaType::Optional(Box::new(LuaType::String))))
         );
     }
@@ -886,7 +1050,10 @@ mod tests {
     #[test]
     fn option_of_vec() {
         assert_eq!(
-            map_rust_type("std::option::Option", &[LuaType::Array(Box::new(LuaType::Integer))]),
+            map_rust_type(
+                "std::option::Option",
+                &[LuaType::Array(Box::new(LuaType::Integer))]
+            ),
             LuaType::Optional(Box::new(LuaType::Array(Box::new(LuaType::Integer))))
         );
     }
@@ -894,7 +1061,10 @@ mod tests {
     #[test]
     fn result_of_vec() {
         assert_eq!(
-            map_rust_type("std::result::Result", &[LuaType::Array(Box::new(LuaType::String)), LuaType::Any]),
+            map_rust_type(
+                "std::result::Result",
+                &[LuaType::Array(Box::new(LuaType::String)), LuaType::Any]
+            ),
             LuaType::Array(Box::new(LuaType::String))
         );
     }
@@ -902,10 +1072,10 @@ mod tests {
     #[test]
     fn map_with_class_values() {
         assert_eq!(
-            map_rust_type("std::collections::HashMap", &[
-                LuaType::String,
-                LuaType::Class("Player".to_string()),
-            ]),
+            map_rust_type(
+                "std::collections::HashMap",
+                &[LuaType::String, LuaType::Class("Player".to_string()),]
+            ),
             LuaType::Map(
                 Box::new(LuaType::String),
                 Box::new(LuaType::Class("Player".to_string()))
@@ -938,7 +1108,12 @@ mod tests {
 
     #[test]
     fn arrayvec_crate_types() {
-        for ty in ["arrayvec::ArrayVec", "smallvec::SmallVec", "tinyvec::TinyVec", "thin_vec::ThinVec"] {
+        for ty in [
+            "arrayvec::ArrayVec",
+            "smallvec::SmallVec",
+            "tinyvec::TinyVec",
+            "thin_vec::ThinVec",
+        ] {
             assert_eq!(
                 map_rust_type(ty, &[LuaType::Integer]),
                 LuaType::Array(Box::new(LuaType::Integer)),
@@ -973,7 +1148,16 @@ mod tests {
 
     #[test]
     fn serde_json_types() {
-        assert_eq!(map_rust_type("serde_json::Value", &[]), LuaType::Any);
+        assert_eq!(
+            map_rust_type("serde_json::Value", &[]),
+            make_union(vec![
+                LuaType::Nil,
+                LuaType::Boolean,
+                LuaType::Number,
+                LuaType::String,
+                LuaType::Table,
+            ])
+        );
         assert_eq!(map_rust_type("serde_json::Number", &[]), LuaType::Number);
         assert_eq!(
             map_rust_type("serde_json::Map", &[LuaType::String, LuaType::Any]),
@@ -1007,7 +1191,10 @@ mod tests {
     #[test]
     fn heuristic_string_suffix() {
         // Unknown types ending in "String" or "Str" → string
-        assert_eq!(map_rust_type("my_crate::MyCustomString", &[]), LuaType::String);
+        assert_eq!(
+            map_rust_type("my_crate::MyCustomString", &[]),
+            LuaType::String
+        );
         assert_eq!(map_rust_type("foo::InternStr", &[]), LuaType::String);
     }
 
@@ -1035,6 +1222,24 @@ mod tests {
         assert_eq!(
             map_rust_type("custom::MySet", &[LuaType::String]),
             LuaType::Array(Box::new(LuaType::String))
+        );
+    }
+
+    #[test]
+    fn heuristic_userdata_ref_suffix() {
+        assert_eq!(
+            map_rust_type(
+                "mlua::userdata::ref::UserDataRef",
+                &[LuaType::Class("File".into())]
+            ),
+            LuaType::Class("File".into())
+        );
+        assert_eq!(
+            map_rust_type(
+                "mlua::userdata::ref::UserDataRefMut",
+                &[LuaType::Class("Url".into())]
+            ),
+            LuaType::Class("Url".into())
         );
     }
 
@@ -1150,18 +1355,36 @@ mod tests {
 
     #[test]
     fn wrapping_saturating_map_to_integer() {
-        assert_eq!(map_rust_type("std::num::Wrapping", &[LuaType::Integer]), LuaType::Integer);
-        assert_eq!(map_rust_type("core::num::Wrapping", &[LuaType::Integer]), LuaType::Integer);
-        assert_eq!(map_rust_type("std::num::Saturating", &[LuaType::Integer]), LuaType::Integer);
-        assert_eq!(map_rust_type("core::num::Saturating", &[LuaType::Integer]), LuaType::Integer);
+        assert_eq!(
+            map_rust_type("std::num::Wrapping", &[LuaType::Integer]),
+            LuaType::Integer
+        );
+        assert_eq!(
+            map_rust_type("core::num::Wrapping", &[LuaType::Integer]),
+            LuaType::Integer
+        );
+        assert_eq!(
+            map_rust_type("std::num::Saturating", &[LuaType::Integer]),
+            LuaType::Integer
+        );
+        assert_eq!(
+            map_rust_type("core::num::Saturating", &[LuaType::Integer]),
+            LuaType::Integer
+        );
     }
 
     // ── Atomic types ─────────────────────────────────────────────────────
 
     #[test]
     fn atomic_bool_maps_to_boolean() {
-        assert_eq!(map_rust_type("std::sync::atomic::AtomicBool", &[]), LuaType::Boolean);
-        assert_eq!(map_rust_type("core::sync::atomic::AtomicBool", &[]), LuaType::Boolean);
+        assert_eq!(
+            map_rust_type("std::sync::atomic::AtomicBool", &[]),
+            LuaType::Boolean
+        );
+        assert_eq!(
+            map_rust_type("core::sync::atomic::AtomicBool", &[]),
+            LuaType::Boolean
+        );
     }
 
     #[test]
@@ -1182,7 +1405,10 @@ mod tests {
     fn double_optional_flattens() {
         // Option<Option<String>> → string? (not string??)
         assert_eq!(
-            map_rust_type("std::option::Option", &[LuaType::Optional(Box::new(LuaType::String))]),
+            map_rust_type(
+                "std::option::Option",
+                &[LuaType::Optional(Box::new(LuaType::String))]
+            ),
             LuaType::Optional(Box::new(LuaType::String))
         );
     }
@@ -1240,7 +1466,11 @@ mod tests {
 
     #[test]
     fn arc_swap_unwraps() {
-        for ty in ["arc_swap::ArcSwap", "arc_swap::ArcSwapOption", "arc_swap::Guard"] {
+        for ty in [
+            "arc_swap::ArcSwap",
+            "arc_swap::ArcSwapOption",
+            "arc_swap::Guard",
+        ] {
             assert_eq!(
                 map_rust_type(ty, &[LuaType::String]),
                 LuaType::String,
@@ -1253,7 +1483,11 @@ mod tests {
 
     #[test]
     fn left_right_unwraps() {
-        for ty in ["left_right::ReadHandle", "left_right::WriteHandle", "left_right::ReadGuard"] {
+        for ty in [
+            "left_right::ReadHandle",
+            "left_right::WriteHandle",
+            "left_right::ReadGuard",
+        ] {
             assert_eq!(
                 map_rust_type(ty, &[LuaType::Table]),
                 LuaType::Table,

@@ -10,8 +10,8 @@ use rustc_span::Symbol;
 use heck::{ToSnakeCase, ToUpperCamelCase};
 use mlua_typegen::typemap::map_rust_type;
 use mlua_typegen::{
-    make_union, LuaApi, LuaClass, LuaEnum, LuaField, LuaFunction, LuaMethod, LuaModule, LuaParam,
-    LuaReturn, LuaType, MethodKind,
+    LuaApi, LuaClass, LuaEnum, LuaField, LuaFunction, LuaMethod, LuaModule, LuaParam, LuaReturn,
+    LuaType, MethodKind, make_union,
 };
 
 fn trace_enabled() -> bool {
@@ -26,15 +26,14 @@ fn trace(msg: impl AsRef<str>) {
     let msg = format!("[mlua-typegen] {}\n", msg.as_ref());
     eprint!("{msg}");
 
-    if let Some(path) = std::env::var_os("MLUA_TYPEGEN_TRACE_FILE") {
-        if let Ok(mut file) = std::fs::OpenOptions::new()
+    if let Some(path) = std::env::var_os("MLUA_TYPEGEN_TRACE_FILE")
+        && let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
-        {
-            use std::io::Write;
-            let _ = file.write_all(msg.as_bytes());
-        }
+    {
+        use std::io::Write;
+        let _ = file.write_all(msg.as_bytes());
     }
 }
 
@@ -77,7 +76,10 @@ fn qualified_def_path_str(tcx: TyCtxt<'_>, def_id: rustc_hir::def_id::DefId) -> 
         return path;
     }
 
-    let crate_name = tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE).as_str().to_string();
+    let crate_name = tcx
+        .crate_name(rustc_hir::def_id::LOCAL_CRATE)
+        .as_str()
+        .to_string();
     if path == crate_name || path.starts_with(&format!("{crate_name}::")) {
         path
     } else {
@@ -87,25 +89,21 @@ fn qualified_def_path_str(tcx: TyCtxt<'_>, def_id: rustc_hir::def_id::DefId) -> 
 
 fn def_snippet(tcx: TyCtxt<'_>, def_id: rustc_hir::def_id::DefId) -> Option<String> {
     let sm = tcx.sess.source_map();
-    if let Some(local) = def_id.as_local() {
-        let span = match tcx.hir_node_by_def_id(local) {
+    let span = def_id.as_local().map_or_else(
+        || tcx.def_span(def_id),
+        |local| match tcx.hir_node_by_def_id(local) {
             rustc_hir::Node::Item(item) => item.span,
             rustc_hir::Node::ImplItem(item) => item.span,
             rustc_hir::Node::TraitItem(item) => item.span,
             rustc_hir::Node::Expr(expr) => expr.span,
             _ => tcx.def_span(def_id),
-        };
-        sm.span_to_snippet(span)
-            .ok()
-            .filter(|snippet| snippet.contains('\n') || snippet.len() > 64)
-            .or_else(|| def_file_context(tcx, span))
-    } else {
-        let span = tcx.def_span(def_id);
-        sm.span_to_snippet(span)
-            .ok()
-            .filter(|snippet| snippet.contains('\n') || snippet.len() > 64)
-            .or_else(|| def_file_context(tcx, span))
-    }
+        },
+    );
+
+    sm.span_to_snippet(span)
+        .ok()
+        .filter(|snippet| snippet.contains('\n') || snippet.len() > 64)
+        .or_else(|| def_file_context(tcx, span))
 }
 
 fn def_file_context(tcx: TyCtxt<'_>, span: rustc_span::Span) -> Option<String> {
@@ -157,66 +155,63 @@ fn contains_self_return_sentinel(ty: &LuaType) -> bool {
     }
 }
 
-fn replace_self_return_sentinel(ty: &mut LuaType, class_name: &str) {
+fn walk_lua_type_mut<F>(ty: &mut LuaType, visit: &mut F)
+where
+    F: FnMut(&mut LuaType),
+{
+    visit(ty);
+
     match ty {
-        LuaType::Class(name) if name.is_empty() => *name = class_name.to_string(),
         LuaType::Array(inner) | LuaType::Optional(inner) | LuaType::Variadic(inner) => {
-            replace_self_return_sentinel(inner, class_name)
+            walk_lua_type_mut(inner, visit)
         }
         LuaType::Map(key, value) => {
-            replace_self_return_sentinel(key, class_name);
-            replace_self_return_sentinel(value, class_name);
+            walk_lua_type_mut(key, visit);
+            walk_lua_type_mut(value, visit);
         }
         LuaType::Union(items) => {
             for item in items {
-                replace_self_return_sentinel(item, class_name);
+                walk_lua_type_mut(item, visit);
             }
         }
         LuaType::FunctionSig { params, returns } => {
             for param in params {
-                replace_self_return_sentinel(param, class_name);
+                walk_lua_type_mut(param, visit);
             }
             for ret in returns {
-                replace_self_return_sentinel(ret, class_name);
+                walk_lua_type_mut(ret, visit);
             }
         }
         _ => {}
     }
+}
+
+fn replace_self_return_sentinel(ty: &mut LuaType, class_name: &str) {
+    walk_lua_type_mut(ty, &mut |ty| {
+        if let LuaType::Class(name) = ty
+            && name.is_empty()
+        {
+            *name = class_name.to_string();
+        }
+    });
 }
 
 fn replace_self_class_alias(ty: &mut LuaType, class_name: &str) {
-    match ty {
-        LuaType::Class(name) if name == "Self" => *name = class_name.to_string(),
-        LuaType::Array(inner) | LuaType::Optional(inner) | LuaType::Variadic(inner) => {
-            replace_self_class_alias(inner, class_name)
+    walk_lua_type_mut(ty, &mut |ty| {
+        if let LuaType::Class(name) = ty
+            && name == "Self"
+        {
+            *name = class_name.to_string();
         }
-        LuaType::Map(key, value) => {
-            replace_self_class_alias(key, class_name);
-            replace_self_class_alias(value, class_name);
-        }
-        LuaType::Union(items) => {
-            for item in items {
-                replace_self_class_alias(item, class_name);
-            }
-        }
-        LuaType::FunctionSig { params, returns } => {
-            for param in params {
-                replace_self_class_alias(param, class_name);
-            }
-            for ret in returns {
-                replace_self_class_alias(ret, class_name);
-            }
-        }
-        _ => {}
-    }
+    });
 }
 
-fn raw_lua_value_type() -> LuaType {
+fn lua_runtime_type() -> LuaType {
     LuaType::Class("Lua".to_string())
 }
 
 thread_local! {
-    static LOCAL_PARAM_INFERENCE_STACK: RefCell<Vec<(LocalDefId, usize)>> = RefCell::new(Vec::new());
+    static LOCAL_PARAM_INFERENCE_STACK: RefCell<Vec<(LocalDefId, usize)>> = const { RefCell::new(Vec::new()) };
 }
 
 struct LocalParamInferenceGuard(LocalDefId, usize);
@@ -256,10 +251,11 @@ fn is_any_user_data(tcx: TyCtxt<'_>, ty: ty::Ty<'_>) -> bool {
             return true;
         }
         // Check Option<AnyUserData> or Result<AnyUserData, _>
-        if (path.ends_with("Option") || path.ends_with("Result")) && !substs.is_empty() {
-            if let Some(inner) = substs[0].as_type() {
-                return is_any_user_data(tcx, inner);
-            }
+        if (path.ends_with("Option") || path.ends_with("Result"))
+            && !substs.is_empty()
+            && let Some(inner) = substs[0].as_type()
+        {
+            return is_any_user_data(tcx, inner);
         }
     }
     false
@@ -283,32 +279,136 @@ macro_rules! walk_loop_body {
     };
 }
 
-/// Extract doc comments (`#[doc = "..."]`) from HIR attributes for a given HirId.
-fn extract_doc_comments(tcx: TyCtxt<'_>, hir_id: hir::HirId) -> Option<String> {
-    let attrs = tcx.hir_attrs(hir_id);
-    let mut lines = Vec::new();
-
-    for attr in attrs {
-        let doc_comment = extract_doc_from_attr(attr);
-        if let Some(comment) = doc_comment {
-            let line = comment.strip_prefix(' ').unwrap_or(&comment);
-            lines.push(line.to_string());
+fn visit_structural_expr_children<'tcx>(
+    expr: &'tcx hir::Expr<'tcx>,
+    mut visit: impl FnMut(&'tcx hir::Expr<'tcx>),
+) {
+    match &expr.kind {
+        hir::ExprKind::Block(block, _) => {
+            for stmt in block.stmts {
+                match &stmt.kind {
+                    hir::StmtKind::Semi(expr) | hir::StmtKind::Expr(expr) => visit(expr),
+                    hir::StmtKind::Let(local) => {
+                        if let Some(init) = local.init {
+                            visit(init);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(expr) = block.expr {
+                visit(expr);
+            }
         }
-    }
-
-    if lines.is_empty() {
-        None
-    } else {
-        Some(lines.join("\n"))
+        hir::ExprKind::If(cond, then_expr, else_expr) => {
+            visit(cond);
+            visit(then_expr);
+            if let Some(else_expr) = else_expr {
+                visit(else_expr);
+            }
+        }
+        hir::ExprKind::Match(scrutinee, arms, _) => {
+            visit(scrutinee);
+            for arm in *arms {
+                visit(arm.body);
+            }
+        }
+        hir::ExprKind::Loop(block, _, _, _) => {
+            walk_loop_body!(block, &mut visit);
+        }
+        hir::ExprKind::DropTemps(inner)
+        | hir::ExprKind::Use(inner, _)
+        | hir::ExprKind::Unary(_, inner)
+        | hir::ExprKind::Cast(inner, _)
+        | hir::ExprKind::Type(inner, _)
+        | hir::ExprKind::Field(inner, _)
+        | hir::ExprKind::AddrOf(_, _, inner)
+        | hir::ExprKind::Become(inner)
+        | hir::ExprKind::Yield(inner, _)
+        | hir::ExprKind::UnsafeBinderCast(_, inner, _) => visit(inner),
+        hir::ExprKind::Assign(lhs, rhs, _) | hir::ExprKind::AssignOp(_, lhs, rhs) => {
+            visit(lhs);
+            visit(rhs);
+        }
+        hir::ExprKind::Index(lhs, rhs, _) | hir::ExprKind::Binary(_, lhs, rhs) => {
+            visit(lhs);
+            visit(rhs);
+        }
+        hir::ExprKind::Array(exprs) | hir::ExprKind::Tup(exprs) => {
+            for expr in *exprs {
+                visit(expr);
+            }
+        }
+        hir::ExprKind::Repeat(value, _) => visit(value),
+        hir::ExprKind::Ret(value) | hir::ExprKind::Break(_, value) => {
+            if let Some(value) = value {
+                visit(value);
+            }
+        }
+        hir::ExprKind::Struct(_, fields, tail) => {
+            for field in *fields {
+                visit(field.expr);
+            }
+            if let hir::StructTailExpr::Base(base) = tail {
+                visit(base);
+            }
+        }
+        hir::ExprKind::Let(let_expr) => visit(let_expr.init),
+        _ => {}
     }
 }
 
+fn visit_recursive_expr_children<'tcx>(
+    expr: &'tcx hir::Expr<'tcx>,
+    mut visit: impl FnMut(&'tcx hir::Expr<'tcx>),
+) {
+    match &expr.kind {
+        hir::ExprKind::Call(callee, args) => {
+            visit(callee);
+            for arg in *args {
+                visit(arg);
+            }
+        }
+        hir::ExprKind::MethodCall(_, receiver, args, _) => {
+            visit(receiver);
+            for arg in *args {
+                visit(arg);
+            }
+        }
+        _ => visit_structural_expr_children(expr, visit),
+    }
+}
+
+fn find_in_recursive_expr_children<'tcx, T>(
+    expr: &'tcx hir::Expr<'tcx>,
+    mut visit: impl FnMut(&'tcx hir::Expr<'tcx>) -> Option<T>,
+) -> Option<T> {
+    let mut found = None;
+    visit_recursive_expr_children(expr, |child| {
+        if found.is_none() {
+            found = visit(child);
+        }
+    });
+    found
+}
+
+/// Extract doc comments (`#[doc = "..."]`) from HIR attributes for a given HirId.
+fn extract_doc_comments(tcx: TyCtxt<'_>, hir_id: hir::HirId) -> Option<String> {
+    let lines: Vec<_> = tcx
+        .hir_attrs(hir_id)
+        .iter()
+        .filter_map(extract_doc_from_attr)
+        .map(|comment| comment.strip_prefix(' ').unwrap_or(comment))
+        .collect();
+
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
 /// Extract doc comment text from a single HIR attribute.
-fn extract_doc_from_attr(attr: &hir::Attribute) -> Option<String> {
-    if let hir::Attribute::Parsed(AttributeKind::DocComment { comment, .. }) = attr {
-        Some(comment.as_str().to_string())
-    } else {
-        None
+fn extract_doc_from_attr(attr: &hir::Attribute) -> Option<&str> {
+    match attr {
+        hir::Attribute::Parsed(AttributeKind::DocComment { comment, .. }) => Some(comment.as_str()),
+        _ => None,
     }
 }
 
@@ -361,14 +461,12 @@ fn collect_lua_api_from_item<'tcx>(tcx: TyCtxt<'tcx>, item: &hir::Item<'tcx>, ap
                         if let Some(class) = extract_class(tcx, item.owner_id.def_id, impl_block) {
                             api.classes.push(class);
                         }
-                    } else if is_into_lua_trait(path) || is_from_lua_trait(path) {
-                        if let Some(lua_enum) =
+                    } else if (is_into_lua_trait(path) || is_from_lua_trait(path))
+                        && let Some(lua_enum) =
                             extract_enum_from_lua_impl(tcx, item.owner_id.def_id)
-                        {
-                            if !api.enums.iter().any(|e| e.name == lua_enum.name) {
-                                api.enums.push(lua_enum);
-                            }
-                        }
+                        && !api.enums.iter().any(|e| e.name == lua_enum.name)
+                    {
+                        api.enums.push(lua_enum);
                     }
                 }
             }
@@ -382,15 +480,10 @@ fn collect_lua_api_from_item<'tcx>(tcx: TyCtxt<'tcx>, item: &hir::Item<'tcx>, ap
             }
         }
         hir::ItemKind::Fn { .. } => {
-            if item
-                .kind
-                .ident()
-                .is_some_and(|ident| ident.name.as_str() == "stage_1")
-            {}
-            if let Some(module) = extract_lua_module_fn(tcx, item) {
+            if let Some(module) = extract_lua_module_from_fn(tcx, item) {
                 api.modules.push(module);
             }
-            extract_registrations_from_fn(tcx, item, &mut *api);
+            extract_registrations_from_fn(tcx, item, api);
         }
         _ => {}
     }
@@ -475,39 +568,25 @@ fn normalize_api_types(api: &mut LuaApi) {
 }
 
 fn normalize_api_lua_type(ty: &mut LuaType, known_names: &HashSet<String>) {
-    match ty {
-        LuaType::Class(name) => {
-            if let Some(parsed) = parse_embedded_lua_type_text(name) {
-                *ty = parsed;
-                normalize_api_lua_type(ty, known_names);
-                return;
-            }
-            if let Some(base) = ref_alias_base_name(name, known_names) {
-                *name = base;
-            }
+    if let LuaType::Class(name) = ty {
+        if let Some(parsed) = parse_embedded_lua_type_text(name) {
+            *ty = parsed;
+        } else if let Some(base) = ref_alias_base_name(name, known_names) {
+            *name = base;
         }
-        LuaType::Array(inner) | LuaType::Optional(inner) | LuaType::Variadic(inner) => {
-            normalize_api_lua_type(inner, known_names);
+    }
+
+    walk_lua_type_mut(ty, &mut |nested| {
+        if let LuaType::Union(items) = nested {
+            *nested = make_union(std::mem::take(items));
         }
-        LuaType::Map(key, value) => {
-            normalize_api_lua_type(key, known_names);
-            normalize_api_lua_type(value, known_names);
-        }
-        LuaType::Union(items) => {
-            for item in items.iter_mut() {
-                normalize_api_lua_type(item, known_names);
-            }
-            *ty = make_union(std::mem::take(items));
-        }
-        LuaType::FunctionSig { params, returns } => {
-            for param in params {
-                normalize_api_lua_type(param, known_names);
-            }
-            for ret in returns {
-                normalize_api_lua_type(ret, known_names);
-            }
-        }
-        _ => {}
+    });
+
+    if let LuaType::Class(name) = ty
+        && let Some(parsed) = parse_embedded_lua_type_text(name)
+    {
+        *ty = parsed;
+        normalize_api_lua_type(ty, known_names);
     }
 }
 
@@ -538,6 +617,24 @@ fn parse_embedded_lua_type_atom(text: &str) -> LuaType {
         "any" => LuaType::Any,
         "thread" => LuaType::Thread,
         other => LuaType::Class(other.to_string()),
+    }
+}
+
+fn writable_field(name: String, ty: LuaType) -> LuaField {
+    LuaField {
+        name,
+        ty,
+        writable: true,
+        doc: None,
+    }
+}
+
+fn readonly_field(name: String, ty: LuaType) -> LuaField {
+    LuaField {
+        name,
+        ty,
+        writable: false,
+        doc: None,
     }
 }
 
@@ -581,7 +678,10 @@ fn ref_alias_base_name(name: &str, known_names: &HashSet<String>) -> Option<Stri
     for suffix in ["RefMut", "Ref"] {
         if let Some(base) = name.strip_suffix(suffix)
             && !base.is_empty()
-            && base.chars().next().is_some_and(|ch| ch.is_ascii_uppercase())
+            && base
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_uppercase())
         {
             return Some(base.to_string());
         }
@@ -595,7 +695,10 @@ fn dedupe_fields(fields: &mut Vec<LuaField>) {
     fields.retain(|field| {
         let inserted = seen.insert(field.name.clone());
         if !inserted && should_trace_field_name(&field.name) {
-            trace(format!("dedupe_fields dropped field={}", field_trace_summary(field)));
+            trace(format!(
+                "dedupe_fields dropped field={}",
+                field_trace_summary(field)
+            ));
         }
         inserted
     });
@@ -606,7 +709,10 @@ fn dedupe_methods(methods: &mut Vec<LuaMethod>) {
     methods.retain(|method| {
         let inserted = seen.insert(method_key(method));
         if !inserted && should_trace_method_name(&method.name) {
-            trace(format!("dedupe_methods dropped method={}", method_trace_summary(method)));
+            trace(format!(
+                "dedupe_methods dropped method={}",
+                method_trace_summary(method)
+            ));
         }
         inserted
     });
@@ -664,11 +770,11 @@ fn synthetic_helper_module_detection_handles_internal_wrapper_tables() {
 #[test]
 fn extracted_name_unwraps_userdata_refs() {
     assert_eq!(
-        lua_type_from_extracted_name("UserDataRef<File>".to_string()),
+        lua_type_from_extracted_name("UserDataRef<File>"),
         LuaType::Class("File".to_string())
     );
     assert_eq!(
-        lua_type_from_extracted_name("UserDataRefMut<Url>".to_string()),
+        lua_type_from_extracted_name("UserDataRefMut<Url>"),
         LuaType::Class("Url".to_string())
     );
 }
@@ -676,7 +782,7 @@ fn extracted_name_unwraps_userdata_refs() {
 #[test]
 fn extracted_name_handles_qualified_option_userdata_ref() {
     assert_eq!(
-        lua_type_from_extracted_name("Option<mlua::UserDataRef<File>>".to_string()),
+        lua_type_from_extracted_name("Option<mlua::UserDataRef<File>>"),
         LuaType::Optional(Box::new(LuaType::Class("File".to_string())))
     );
 }
@@ -768,7 +874,10 @@ fn is_from_lua_trait(path: &str) -> bool {
 // ── #[mlua::lua_module] detection ───────────────────────────────────────
 
 /// Detect `#[mlua::lua_module]` functions and extract the module they build.
-fn extract_lua_module_fn<'tcx>(tcx: TyCtxt<'tcx>, item: &hir::Item<'tcx>) -> Option<LuaModule> {
+fn extract_lua_module_from_fn<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    item: &hir::Item<'tcx>,
+) -> Option<LuaModule> {
     let attrs = tcx.hir_attrs(item.hir_id());
     let mut module_attr = None;
 
@@ -844,103 +953,37 @@ fn visit_expr_for_module_exports<'tcx>(
     expr: &'tcx hir::Expr<'tcx>,
     module: &mut LuaModule,
 ) {
+    if let Some(export_name) = extract_named_set_call(expr) {
+        let NamedSetCall { name, value } = export_name;
+        let exported = classify_exported_value(tcx, value, &name, None);
+        push_exported_value(module, name, exported, None);
+    }
+
+    visit_structural_expr_children(expr, |child| {
+        visit_expr_for_module_exports(tcx, child, module);
+    });
+}
+
+struct NamedSetCall<'tcx> {
+    name: String,
+    value: &'tcx hir::Expr<'tcx>,
+}
+
+fn extract_named_set_call<'tcx>(expr: &'tcx hir::Expr<'tcx>) -> Option<NamedSetCall<'tcx>> {
     match &expr.kind {
-        hir::ExprKind::Block(block, _) => {
-            for stmt in block.stmts {
-                match &stmt.kind {
-                    hir::StmtKind::Semi(e) | hir::StmtKind::Expr(e) => {
-                        visit_expr_for_module_exports(tcx, e, module);
-                    }
-                    hir::StmtKind::Let(local) => {
-                        if let Some(init) = local.init {
-                            visit_expr_for_module_exports(tcx, init, module);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            if let Some(e) = block.expr {
-                visit_expr_for_module_exports(tcx, e, module);
-            }
-        }
-        hir::ExprKind::If(cond, then_block, else_block) => {
-            visit_expr_for_module_exports(tcx, cond, module);
-            visit_expr_for_module_exports(tcx, then_block, module);
-            if let Some(else_expr) = else_block {
-                visit_expr_for_module_exports(tcx, else_expr, module);
-            }
-        }
-        hir::ExprKind::Match(scrutinee, arms, _) => {
-            visit_expr_for_module_exports(tcx, scrutinee, module);
-            for arm in *arms {
-                visit_expr_for_module_exports(tcx, arm.body, module);
-            }
-        }
-        hir::ExprKind::Loop(block, _, _, _) => {
-            walk_loop_body!(block, |e| visit_expr_for_module_exports(tcx, e, module));
-        }
-        hir::ExprKind::DropTemps(inner)
-        | hir::ExprKind::Use(inner, _)
-        | hir::ExprKind::Unary(_, inner)
-        | hir::ExprKind::Cast(inner, _)
-        | hir::ExprKind::Type(inner, _)
-        | hir::ExprKind::Field(inner, _)
-        | hir::ExprKind::AddrOf(_, _, inner)
-        | hir::ExprKind::Become(inner)
-        | hir::ExprKind::Yield(inner, _)
-        | hir::ExprKind::UnsafeBinderCast(_, inner, _) => {
-            visit_expr_for_module_exports(tcx, inner, module);
-        }
-        hir::ExprKind::Assign(lhs, rhs, _) | hir::ExprKind::AssignOp(_, lhs, rhs) => {
-            visit_expr_for_module_exports(tcx, lhs, module);
-            visit_expr_for_module_exports(tcx, rhs, module);
-        }
-        hir::ExprKind::Index(lhs, rhs, _) | hir::ExprKind::Binary(_, lhs, rhs) => {
-            visit_expr_for_module_exports(tcx, lhs, module);
-            visit_expr_for_module_exports(tcx, rhs, module);
-        }
-        hir::ExprKind::Array(exprs) | hir::ExprKind::Tup(exprs) => {
-            for expr in *exprs {
-                visit_expr_for_module_exports(tcx, expr, module);
-            }
-        }
-        hir::ExprKind::Repeat(value, _) => visit_expr_for_module_exports(tcx, value, module),
-        hir::ExprKind::Ret(value) | hir::ExprKind::Break(_, value) => {
-            if let Some(value) = value {
-                visit_expr_for_module_exports(tcx, value, module);
-            }
-        }
-        hir::ExprKind::Struct(_, fields, tail) => {
-            for field in *fields {
-                visit_expr_for_module_exports(tcx, field.expr, module);
-            }
-            if let hir::StructTailExpr::Base(base) = tail {
-                visit_expr_for_module_exports(tcx, base, module);
-            }
-        }
-        hir::ExprKind::Let(let_expr) => {
-            visit_expr_for_module_exports(tcx, let_expr.init, module);
-        }
         hir::ExprKind::MethodCall(segment, _receiver, args, _span) => {
             let method_name = segment.ident.name.as_str();
-            if (method_name == "set" || method_name == "raw_set") && args.len() >= 2 {
-                if let Some(name) = extract_string_literal(&args[0]) {
-                    if let Some(func) = try_extract_create_function(tcx, &args[1], &name) {
-                        module.functions.push(func);
-                    } else {
-                        // Non-function value being set on the module table
-                        let ty = infer_expr_lua_type(tcx, &args[1]);
-                        module.fields.push(LuaField {
-                            name,
-                            ty,
-                            writable: true,
-                            doc: None,
-                        });
-                    }
-                }
-            }
+            let export_name = ((method_name == "set" || method_name == "raw_set")
+                && args.len() >= 2)
+                .then(|| extract_string_literal(&args[0]))
+                .flatten();
+
+            export_name.map(|name| NamedSetCall {
+                name,
+                value: &args[1],
+            })
         }
-        _ => {}
+        _ => None,
     }
 }
 
@@ -1045,237 +1088,230 @@ struct RegistrationCtx<'a, 'tcx> {
     module_children: HashMap<String, Vec<String>>,
 }
 
+fn visit_registration_block<'tcx>(
+    ctx: &mut RegistrationCtx<'_, 'tcx>,
+    block: &'tcx hir::Block<'tcx>,
+) {
+    for stmt in block.stmts {
+        match &stmt.kind {
+            hir::StmtKind::Semi(expr) | hir::StmtKind::Expr(expr) => {
+                visit_expr_for_registrations(ctx, expr);
+            }
+            hir::StmtKind::Let(local) => {
+                if let Some(init) = local.init {
+                    if let Some(binding) = extract_binding_name(local.pat) {
+                        if is_globals_call(init) {
+                            ctx.global_bindings.insert(binding.clone());
+                        }
+                        if let Some(module) = create_table_module_from_expr(ctx.tcx, init, &binding)
+                        {
+                            upsert_extracted_module(ctx.api, module);
+                            ctx.local_module_names.insert(binding.clone());
+                            let idx = resolve_module_index(ctx, &binding)
+                                .unwrap_or(ctx.api.modules.len());
+                            ctx.table_bindings.insert(binding, idx);
+                        } else if let Some(module_name) =
+                            try_extract_module_name_from_call(ctx.tcx, init)
+                        {
+                            let extracted = ExtractedModule {
+                                module: LuaModule {
+                                    name: module_name.clone(),
+                                    doc: None,
+                                    functions: Vec::new(),
+                                    fields: Vec::new(),
+                                },
+                                nested_modules: Vec::new(),
+                            };
+                            upsert_extracted_module(ctx.api, extracted);
+                            ctx.local_module_names.insert(module_name.clone());
+                            let idx = resolve_module_index(ctx, &module_name)
+                                .unwrap_or(ctx.api.modules.len());
+                            ctx.table_bindings.insert(binding, idx);
+                            mark_module_exported(ctx, &module_name);
+                        }
+                    }
+                    visit_expr_for_registrations(ctx, init);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(expr) = block.expr {
+        visit_expr_for_registrations(ctx, expr);
+    }
+}
+
+fn is_global_registration_target<'tcx>(
+    ctx: &RegistrationCtx<'_, 'tcx>,
+    receiver: &'tcx hir::Expr<'tcx>,
+    receiver_name: Option<&str>,
+) -> bool {
+    is_globals_call(receiver)
+        || receiver_name.is_some_and(|name| ctx.global_bindings.contains(name))
+}
+
+fn rename_registered_module_binding<'tcx>(
+    ctx: &mut RegistrationCtx<'_, 'tcx>,
+    binding_name: &str,
+    exported_name: &str,
+) -> bool {
+    let Some(&idx) = ctx.table_bindings.get(binding_name) else {
+        return false;
+    };
+
+    trace(format!(
+        "renaming module binding {binding_name} -> {exported_name}"
+    ));
+    ctx.api.modules[idx].name = exported_name.to_string();
+    ctx.table_bindings.insert(exported_name.to_string(), idx);
+    ctx.local_module_names.insert(exported_name.to_string());
+    mark_module_exported(ctx, exported_name);
+    true
+}
+
+fn record_exported_registration_module<'tcx>(
+    ctx: &mut RegistrationCtx<'_, 'tcx>,
+    extracted: ExtractedModule,
+) {
+    trace(format!("extracted global module {}", extracted.module.name));
+    let module_name = upsert_extracted_module(ctx.api, extracted);
+    ctx.local_module_names.insert(module_name.clone());
+    mark_module_exported(ctx, &module_name);
+}
+
+fn record_global_registration_field<'tcx>(
+    ctx: &mut RegistrationCtx<'_, 'tcx>,
+    name: &str,
+    value: &'tcx hir::Expr<'tcx>,
+) {
+    trace(format!("recording global field {name}"));
+    ctx.api.global_fields.push(writable_field(
+        name.to_string(),
+        infer_value_expr_lua_type(ctx.tcx, value),
+    ));
+}
+
+fn handle_global_registration<'tcx>(
+    ctx: &mut RegistrationCtx<'_, 'tcx>,
+    name: &str,
+    value: &'tcx hir::Expr<'tcx>,
+) {
+    if let Some(binding_name) = table_binding_name(value)
+        && rename_registered_module_binding(ctx, &binding_name, name)
+    {
+        return;
+    }
+
+    if let Some(module) = try_extract_module_from_value_expr(ctx.tcx, value, name) {
+        record_exported_registration_module(ctx, module);
+        return;
+    }
+
+    record_global_registration_field(ctx, name, value);
+}
+
+fn handle_module_registration<'tcx>(
+    ctx: &mut RegistrationCtx<'_, 'tcx>,
+    module_name: &str,
+    field_name: &str,
+    value: &'tcx hir::Expr<'tcx>,
+) {
+    let Some(idx) = resolve_module_index(ctx, module_name) else {
+        trace(format!(
+            "skipping field {field_name} on non-exported table {module_name}"
+        ));
+        return;
+    };
+
+    let parent_name = ctx.api.modules[idx].name.clone();
+    trace(format!(
+        "recording field {field_name} on module {parent_name}"
+    ));
+    ctx.api.modules[idx].fields.push(writable_field(
+        field_name.to_string(),
+        infer_value_expr_lua_type(ctx.tcx, value),
+    ));
+
+    let child_module_name = nested_module_name(&parent_name, field_name);
+    if let Some(module) = try_extract_module_from_value_expr(ctx.tcx, value, &child_module_name) {
+        let child_name = module.module.name.clone();
+        trace(format!("extracted child module {}", child_name));
+        upsert_extracted_module(ctx.api, module);
+        ctx.local_module_names.insert(child_name.clone());
+        ctx.module_children
+            .entry(parent_name.clone())
+            .or_default()
+            .push(child_name.clone());
+        if ctx.exported_module_names.contains(&parent_name) {
+            mark_module_exported(ctx, &child_name);
+        }
+        if let Some(field) = ctx.api.modules[idx]
+            .fields
+            .iter_mut()
+            .find(|field| field.name == field_name)
+        {
+            field.ty = LuaType::Class(child_name);
+        }
+    }
+}
+
+fn handle_named_registration<'tcx>(
+    ctx: &mut RegistrationCtx<'_, 'tcx>,
+    receiver: &'tcx hir::Expr<'tcx>,
+    name: &str,
+    value: &'tcx hir::Expr<'tcx>,
+) {
+    let receiver_name = table_binding_name(receiver);
+    let is_globals = is_global_registration_target(ctx, receiver, receiver_name.as_deref());
+
+    trace(format!(
+        "saw set({}, ...) receiver={} globals={} value={}",
+        name,
+        expr_snippet(ctx.tcx, receiver),
+        is_globals,
+        expr_snippet(ctx.tcx, value)
+    ));
+
+    if let Some(func) = try_extract_create_function(ctx.tcx, value, name) {
+        trace(format!("extracted function {name}"));
+        if is_globals {
+            ctx.api.global_functions.push(func);
+        } else if let Some(module_name) = receiver_name.as_deref()
+            && let Some(idx) = resolve_module_index(ctx, module_name)
+        {
+            ctx.api.modules[idx].functions.push(func);
+        }
+        return;
+    }
+
+    if is_globals {
+        handle_global_registration(ctx, name, value);
+    } else if let Some(module_name) = receiver_name.as_deref() {
+        handle_module_registration(ctx, module_name, name, value);
+    }
+}
+
 fn visit_expr_for_registrations<'tcx>(
     ctx: &mut RegistrationCtx<'_, 'tcx>,
     expr: &'tcx hir::Expr<'tcx>,
 ) {
     match &expr.kind {
         hir::ExprKind::Block(block, _) => {
-            for stmt in block.stmts {
-                match &stmt.kind {
-                    hir::StmtKind::Semi(e) | hir::StmtKind::Expr(e) => {
-                        visit_expr_for_registrations(ctx, e);
-                    }
-                    hir::StmtKind::Let(local) => {
-                        if let Some(init) = local.init {
-                            if let Some(binding) = extract_binding_name(local.pat) {
-                                if is_globals_call(init) {
-                                    ctx.global_bindings.insert(binding.clone());
-                                }
-                                if let Some(module) =
-                                    create_table_module_from_expr(ctx.tcx, init, &binding)
-                                {
-                                    upsert_extracted_module(ctx.api, module);
-                                    ctx.local_module_names.insert(binding.clone());
-                                    let idx = resolve_module_index(ctx, &binding)
-                                        .unwrap_or(ctx.api.modules.len());
-                                    ctx.table_bindings.insert(binding, idx);
-                                }
-                            }
-                            visit_expr_for_registrations(ctx, init);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            if let Some(e) = block.expr {
-                visit_expr_for_registrations(ctx, e);
-            }
+            visit_registration_block(ctx, block);
         }
-
-        hir::ExprKind::If(cond, then_block, else_block) => {
-            visit_expr_for_registrations(ctx, cond);
-            visit_expr_for_registrations(ctx, then_block);
-            if let Some(else_expr) = else_block {
-                visit_expr_for_registrations(ctx, else_expr);
-            }
-        }
-        hir::ExprKind::Match(scrutinee, arms, _) => {
-            visit_expr_for_registrations(ctx, scrutinee);
-            for arm in *arms {
-                visit_expr_for_registrations(ctx, arm.body);
-            }
-        }
-        hir::ExprKind::Loop(block, _, _, _) => {
-            walk_loop_body!(block, |e| visit_expr_for_registrations(ctx, e));
-        }
-        hir::ExprKind::DropTemps(inner)
-        | hir::ExprKind::Use(inner, _)
-        | hir::ExprKind::Unary(_, inner)
-        | hir::ExprKind::Cast(inner, _)
-        | hir::ExprKind::Type(inner, _)
-        | hir::ExprKind::Field(inner, _)
-        | hir::ExprKind::AddrOf(_, _, inner)
-        | hir::ExprKind::Become(inner)
-        | hir::ExprKind::Yield(inner, _)
-        | hir::ExprKind::UnsafeBinderCast(_, inner, _) => {
-            visit_expr_for_registrations(ctx, inner);
-        }
-        hir::ExprKind::Assign(lhs, rhs, _) | hir::ExprKind::AssignOp(_, lhs, rhs) => {
-            visit_expr_for_registrations(ctx, lhs);
-            visit_expr_for_registrations(ctx, rhs);
-        }
-        hir::ExprKind::Index(lhs, rhs, _) | hir::ExprKind::Binary(_, lhs, rhs) => {
-            visit_expr_for_registrations(ctx, lhs);
-            visit_expr_for_registrations(ctx, rhs);
-        }
-        hir::ExprKind::Array(exprs) | hir::ExprKind::Tup(exprs) => {
-            for expr in *exprs {
-                visit_expr_for_registrations(ctx, expr);
-            }
-        }
-        hir::ExprKind::Repeat(value, _) => visit_expr_for_registrations(ctx, value),
-        hir::ExprKind::Ret(value) | hir::ExprKind::Break(_, value) => {
-            if let Some(value) = value {
-                visit_expr_for_registrations(ctx, value);
-            }
-        }
-        hir::ExprKind::Struct(_, fields, tail) => {
-            for field in *fields {
-                visit_expr_for_registrations(ctx, field.expr);
-            }
-            if let hir::StructTailExpr::Base(base) = tail {
-                visit_expr_for_registrations(ctx, base);
-            }
-        }
-        hir::ExprKind::Let(let_expr) => {
-            visit_expr_for_registrations(ctx, let_expr.init);
-        }
-
-        // Match: <receiver>.set("name", <value>) or raw_set
-        hir::ExprKind::MethodCall(segment, receiver, args, _span) => {
-            let method_name = segment.ident.name.as_str();
-
-            if (method_name == "set" || method_name == "raw_set") && args.len() >= 2 {
-                if let Some(name) = extract_string_literal(&args[0]) {
-                    let receiver_name = get_table_name(receiver);
-                    let is_globals = is_globals_call(receiver)
-                        || receiver_name
-                            .as_ref()
-                            .is_some_and(|name| ctx.global_bindings.contains(name));
-                    trace(format!(
-                        "saw {}({}, ...) receiver={} globals={} value={}",
-                        method_name,
-                        name,
-                        expr_snippet(ctx.tcx, receiver),
-                        is_globals,
-                        expr_snippet(ctx.tcx, &args[1])
-                    ));
-
-                    if let Some(func) = try_extract_create_function(ctx.tcx, &args[1], &name) {
-                        trace(format!("extracted function {name}"));
-                        if is_globals {
-                            ctx.api.global_functions.push(func);
-                        } else {
-                            let module_name = receiver_name
-                                .clone()
-                                .unwrap_or_else(|| "unknown".to_string());
-                            if let Some(idx) = resolve_module_index(ctx, &module_name) {
-                                ctx.api.modules[idx].functions.push(func);
-                            }
-                        }
-                    } else if is_globals {
-                        if let Some(var_name) = get_table_name(&args[1]) {
-                            if let Some(&idx) = ctx.table_bindings.get(&var_name) {
-                                trace(format!("renaming module binding {var_name} -> {name}"));
-                                ctx.api.modules[idx].name = name.clone();
-                                ctx.table_bindings.insert(name.clone(), idx);
-                                ctx.local_module_names.insert(name.clone());
-                                mark_module_exported(ctx, &name);
-                            } else if let Some(module) =
-                                try_extract_module_from_value_expr(ctx.tcx, &args[1], &name)
-                            {
-                                trace(format!("extracted global module {}", module.module.name));
-                                let module_name = upsert_extracted_module(ctx.api, module);
-                                ctx.local_module_names.insert(module_name.clone());
-                                mark_module_exported(ctx, &module_name);
-                            } else {
-                                trace(format!("recording global field {name}"));
-                                ctx.api.global_fields.push(LuaField {
-                                    name,
-                                    ty: infer_value_expr_lua_type(ctx.tcx, &args[1]),
-                                    writable: true,
-                                    doc: None,
-                                });
-                            }
-                        } else if let Some(module) =
-                            try_extract_module_from_value_expr(ctx.tcx, &args[1], &name)
-                        {
-                            trace(format!("extracted global module {}", module.module.name));
-                            let module_name = upsert_extracted_module(ctx.api, module);
-                            ctx.local_module_names.insert(module_name.clone());
-                            mark_module_exported(ctx, &module_name);
-                        } else {
-                            trace(format!("recording global field {name}"));
-                            ctx.api.global_fields.push(LuaField {
-                                name,
-                                ty: infer_value_expr_lua_type(ctx.tcx, &args[1]),
-                                writable: true,
-                                doc: None,
-                            });
-                        }
-                    } else {
-                        let Some(module_name) = receiver_name else {
-                            return;
-                        };
-                        let Some(idx) = resolve_module_index(ctx, &module_name) else {
-                            trace(format!(
-                                "skipping field {name} on non-exported table {module_name}"
-                            ));
-                            return;
-                        };
-                        trace(format!("recording field {name} on module {module_name}"));
-                        ctx.api.modules[idx].fields.push(LuaField {
-                            name: name.clone(),
-                            ty: infer_value_expr_lua_type(ctx.tcx, &args[1]),
-                            writable: true,
-                            doc: None,
-                        });
-                        if let Some(module) = try_extract_module_from_value_expr(
-                            ctx.tcx,
-                            &args[1],
-                            &submodule_name(&ctx.api.modules[idx].name, &args[0]),
-                        ) {
-                            let child_name = module.module.name.clone();
-                            trace(format!("extracted child module {}", child_name));
-                            upsert_extracted_module(ctx.api, module);
-                            ctx.local_module_names.insert(child_name.clone());
-                            ctx.module_children
-                                .entry(ctx.api.modules[idx].name.clone())
-                                .or_default()
-                                .push(child_name.clone());
-                            if ctx
-                                .exported_module_names
-                                .contains(&ctx.api.modules[idx].name)
-                            {
-                                mark_module_exported(ctx, &child_name);
-                            }
-                            if let Some(field) = ctx.api.modules[idx]
-                                .fields
-                                .iter_mut()
-                                .find(|field| field.name == name)
-                            {
-                                field.ty = LuaType::Class(child_name);
-                            }
-                        }
-                    }
-                }
+        hir::ExprKind::MethodCall(_, receiver, _, _) => {
+            if let Some(named_call) = extract_named_set_call(expr) {
+                handle_named_registration(ctx, receiver, &named_call.name, named_call.value);
             }
 
-            // Recurse into receiver and args
-            visit_expr_for_registrations(ctx, receiver);
-            for arg in *args {
-                visit_expr_for_registrations(ctx, arg);
-            }
+            visit_recursive_expr_children(expr, |child| {
+                visit_expr_for_registrations(ctx, child);
+            });
         }
-
-        hir::ExprKind::Call(_, args) => {
-            for arg in *args {
-                visit_expr_for_registrations(ctx, arg);
-            }
-        }
-
-        _ => {}
+        _ => visit_recursive_expr_children(expr, |child| {
+            visit_expr_for_registrations(ctx, child);
+        }),
     }
 }
 
@@ -1335,11 +1371,6 @@ fn upsert_module(api: &mut LuaApi, module: LuaModule) {
     }
 }
 
-fn submodule_name(parent: &str, key_expr: &hir::Expr<'_>) -> String {
-    let key = extract_string_literal(key_expr).unwrap_or_else(|| "value".to_string());
-    format!("{parent}__{}", key.to_upper_camel_case())
-}
-
 /// Check if an expression is `lua.globals()` or `<something>.globals()`.
 fn is_globals_call(expr: &hir::Expr<'_>) -> bool {
     let expr = peel_expr(expr);
@@ -1350,7 +1381,7 @@ fn is_globals_call(expr: &hir::Expr<'_>) -> bool {
 }
 
 /// Try to get a name for a table variable (best effort).
-fn get_table_name(expr: &hir::Expr<'_>) -> Option<String> {
+fn table_binding_name(expr: &hir::Expr<'_>) -> Option<String> {
     let expr = peel_expr(expr);
     match &expr.kind {
         hir::ExprKind::Path(hir::QPath::Resolved(_, path)) => path
@@ -1358,6 +1389,57 @@ fn get_table_name(expr: &hir::Expr<'_>) -> Option<String> {
             .last()
             .map(|s| s.ident.name.as_str().to_string()),
         _ => None,
+    }
+}
+
+fn nested_module_name(parent: &str, field_name: &str) -> String {
+    format!("{parent}__{}", field_name.to_upper_camel_case())
+}
+
+enum ExportedValue {
+    Function(LuaFunction),
+    NestedModule(ExtractedModule),
+    Field(LuaType),
+}
+
+fn classify_exported_value<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+    name: &str,
+    nested_module_name: Option<&str>,
+) -> ExportedValue {
+    if let Some(func) = try_extract_create_function(tcx, expr, name) {
+        return ExportedValue::Function(func);
+    }
+
+    if let Some(module_name) = nested_module_name
+        && let Some(module) = try_extract_module_from_value_expr(tcx, expr, module_name)
+    {
+        return ExportedValue::NestedModule(module);
+    }
+
+    ExportedValue::Field(infer_value_expr_lua_type(tcx, expr))
+}
+
+fn push_exported_value(
+    module: &mut LuaModule,
+    name: String,
+    value: ExportedValue,
+    nested_modules: Option<&mut Vec<LuaModule>>,
+) {
+    match value {
+        ExportedValue::Function(func) => module.functions.push(func),
+        ExportedValue::NestedModule(extracted) => {
+            let nested_name = extracted.module.name.clone();
+            module
+                .fields
+                .push(writable_field(name, LuaType::Class(nested_name)));
+            if let Some(nested_modules) = nested_modules {
+                nested_modules.extend(extracted.nested_modules);
+                nested_modules.push(extracted.module);
+            }
+        }
+        ExportedValue::Field(ty) => module.fields.push(writable_field(name, ty)),
     }
 }
 
@@ -1378,19 +1460,19 @@ fn upsert_extracted_module(api: &mut LuaApi, extracted: ExtractedModule) -> Stri
 fn infer_value_expr_lua_type<'tcx>(tcx: TyCtxt<'tcx>, expr: &'tcx hir::Expr<'tcx>) -> LuaType {
     let expr = peel_lua_conversion_expr(expr);
 
-    if let Some(ty) = infer_wrapper_method_lua_type(tcx, expr) {
-        if is_informative(&ty) || matches!(ty, LuaType::Class(_) | LuaType::Optional(_)) {
-            return ty;
-        }
+    if let Some(ty) = infer_wrapper_method_lua_type(tcx, expr)
+        && (is_informative(&ty) || matches!(ty, LuaType::Class(_) | LuaType::Optional(_)))
+    {
+        return ty;
     }
 
     if let hir::ExprKind::MethodCall(segment, _receiver, args, _) = &expr.kind {
         match segment.ident.name.as_str() {
             "create_sequence_from" => {
-                if let Some(values_expr) = args.first() {
-                    if let Some(item_ty) = infer_sequence_item_lua_type(tcx, values_expr) {
-                        return LuaType::Array(Box::new(item_ty));
-                    }
+                if let Some(values_expr) = args.first()
+                    && let Some(item_ty) = infer_sequence_item_lua_type(tcx, values_expr)
+                {
+                    return LuaType::Array(Box::new(item_ty));
                 }
             }
             "to_value" | "to_value_with" => {
@@ -1497,7 +1579,7 @@ fn infer_wrapper_method_lua_type<'tcx>(
             .first()
             .and_then(|values_expr| infer_sequence_item_lua_type(tcx, values_expr))
             .map(|item_ty| LuaType::Array(Box::new(item_ty))),
-        "to_value" | "to_value_with" => Some(raw_lua_value_type()),
+        "to_value" | "to_value_with" => Some(lua_runtime_type()),
         _ => None,
     }
 }
@@ -1609,7 +1691,9 @@ fn collect_named_registry_value_types<'tcx>(
             .iter()
             .flat_map(|field| collect_named_registry_value_types(tcx, field.expr, key))
             .chain(match tail {
-                hir::StructTailExpr::Base(base) => collect_named_registry_value_types(tcx, base, key),
+                hir::StructTailExpr::Base(base) => {
+                    collect_named_registry_value_types(tcx, base, key)
+                }
                 _ => Vec::new(),
             })
             .collect(),
@@ -1690,7 +1774,7 @@ fn should_replace_returns(existing: &[LuaReturn], inferred: &[LuaReturn]) -> boo
         return !existing.is_empty();
     }
 
-    if inferred.is_empty() || inferred.iter().all(|ret| !is_informative(&ret.ty)) {
+    if inferred.iter().all(|ret| !is_informative(&ret.ty)) {
         return false;
     }
 
@@ -1706,6 +1790,14 @@ fn should_replace_returns(existing: &[LuaReturn], inferred: &[LuaReturn]) -> boo
         .iter()
         .zip(inferred)
         .all(|(existing, inferred)| should_prefer_body_inference(&existing.ty, &inferred.ty))
+}
+
+fn merge_inferred_returns(returns: &mut Vec<LuaReturn>, inferred: Option<Vec<LuaReturn>>) {
+    if let Some(inferred) = inferred
+        && should_replace_returns(returns, &inferred)
+    {
+        *returns = inferred;
+    }
 }
 
 fn is_erased_body_type(ty: &LuaType) -> bool {
@@ -1816,6 +1908,37 @@ fn create_table_module_from_expr<'tcx>(
     })
 }
 
+/// Detect calls like `get_or_create_module(lua, "wezterm")` or
+/// `get_or_create_sub_module(lua, "color")` and extract the module name
+/// from the string literal argument.
+fn try_extract_module_name_from_call<'tcx>(
+    _tcx: TyCtxt<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+) -> Option<String> {
+    let expr = peel_lua_conversion_expr(expr);
+
+    match &expr.kind {
+        hir::ExprKind::Call(callee, args) => {
+            // Free function call: get_or_create_module(lua, "name")
+            let callee_name = path_tail_name(callee)?;
+            if !callee_name.contains("module") {
+                return None;
+            }
+            // Extract the string literal argument (usually the last one).
+            args.iter().rev().find_map(extract_string_literal)
+        }
+        hir::ExprKind::MethodCall(segment, _receiver, args, _) => {
+            // Method call: lua.create_named_module("name") or similar
+            let method = segment.ident.name.as_str();
+            if !method.contains("module") {
+                return None;
+            }
+            args.iter().rev().find_map(extract_string_literal)
+        }
+        _ => None,
+    }
+}
+
 fn populate_module_from_table_entries<'tcx>(
     tcx: TyCtxt<'tcx>,
     expr: &'tcx hir::Expr<'tcx>,
@@ -1839,29 +1962,13 @@ fn populate_module_from_table_entries<'tcx>(
             continue;
         };
 
-        if let Some(func) = try_extract_create_function(tcx, &parts[1], &name) {
-            module.functions.push(func);
-        } else if let Some(extracted) = try_extract_module_from_value_expr(
+        let exported = classify_exported_value(
             tcx,
             &parts[1],
-            &format!("{module_name}__{}", name.to_upper_camel_case()),
-        ) {
-            module.fields.push(LuaField {
-                name,
-                ty: LuaType::Class(extracted.module.name.clone()),
-                writable: true,
-                doc: None,
-            });
-            nested_modules.extend(extracted.nested_modules);
-            nested_modules.push(extracted.module);
-        } else {
-            module.fields.push(LuaField {
-                name,
-                ty: infer_value_expr_lua_type(tcx, &parts[1]),
-                writable: true,
-                doc: None,
-            });
-        }
+            &name,
+            Some(&nested_module_name(module_name, &name)),
+        );
+        push_exported_value(module, name, exported, Some(nested_modules));
     }
 }
 
@@ -1971,25 +2078,13 @@ fn extract_composer_get_module<'tcx>(
             continue;
         }
 
-        let child_name = format!("{module_name}__{}", key.to_upper_camel_case());
-        if let Some(extracted) = try_extract_module_from_value_expr(tcx, value_expr, &child_name) {
-            module.fields.push(LuaField {
-                name: key,
-                ty: LuaType::Class(extracted.module.name.clone()),
-                writable: true,
-                doc: None,
-            });
-            nested_modules.extend(extracted.nested_modules);
-            nested_modules.push(extracted.module);
-            continue;
-        }
-
-        module.fields.push(LuaField {
-            name: key,
-            ty: infer_value_expr_lua_type(tcx, value_expr),
-            writable: true,
-            doc: None,
-        });
+        let exported = classify_exported_value(
+            tcx,
+            value_expr,
+            &key,
+            Some(&nested_module_name(module_name, &key)),
+        );
+        push_exported_value(&mut module, key, exported, Some(&mut nested_modules));
     }
 
     Some(ExtractedModule {
@@ -2084,50 +2179,10 @@ fn find_create_function_in_expr<'tcx>(
     }
 
     match &expr.kind {
-        hir::ExprKind::Block(block, _) => {
-            for stmt in block.stmts {
-                match &stmt.kind {
-                    hir::StmtKind::Semi(e) | hir::StmtKind::Expr(e) => {
-                        if let Some(func) = find_create_function_in_expr(tcx, e, name) {
-                            return Some(func);
-                        }
-                    }
-                    hir::StmtKind::Let(local) => {
-                        if let Some(init) = local.init {
-                            if let Some(func) = find_create_function_in_expr(tcx, init, name) {
-                                return Some(func);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            block
-                .expr
-                .and_then(|tail| find_create_function_in_expr(tcx, tail, name))
-        }
-        hir::ExprKind::Match(scrutinee, arms, _) => {
-            find_create_function_in_expr(tcx, scrutinee, name).or_else(|| {
-                arms.iter()
-                    .find_map(|arm| find_create_function_in_expr(tcx, arm.body, name))
-            })
-        }
-        hir::ExprKind::If(_, then_expr, else_expr) => {
-            find_create_function_in_expr(tcx, then_expr, name)
-                .or_else(|| else_expr.and_then(|e| find_create_function_in_expr(tcx, e, name)))
-        }
-        hir::ExprKind::Call(callee, args) => find_create_function_in_expr(tcx, callee, name)
-            .or_else(|| {
-                args.iter()
-                    .find_map(|arg| find_create_function_in_expr(tcx, arg, name))
-            }),
-        hir::ExprKind::MethodCall(_, receiver, args, _) => {
-            find_create_function_in_expr(tcx, receiver, name).or_else(|| {
-                args.iter()
-                    .find_map(|arg| find_create_function_in_expr(tcx, arg, name))
-            })
-        }
-        _ => None,
+        hir::ExprKind::Closure(_) => None,
+        _ => find_in_recursive_expr_children(expr, |child| {
+            find_create_function_in_expr(tcx, child, name)
+        }),
     }
 }
 
@@ -2153,8 +2208,10 @@ fn try_extract_create_function<'tcx>(
             ) && !args.is_empty()
             {
                 let closure_expr = args.first()?;
-                let (params, returns) = extract_standalone_closure_signature(tcx, closure_expr)?;
                 let is_async = method.starts_with("create_async_");
+                // Try inline closure first, then named function reference
+                let (params, returns) = extract_standalone_closure_signature(tcx, closure_expr)
+                    .or_else(|| extract_named_fn_callback_signature(tcx, closure_expr))?;
                 let func = LuaFunction {
                     name: name.to_string(),
                     is_async,
@@ -2178,11 +2235,10 @@ fn unwrap_try_expr<'tcx>(expr: &'tcx hir::Expr<'tcx>) -> &'tcx hir::Expr<'tcx> {
         return unwrap_try_expr(scrutinee);
     }
     if let hir::ExprKind::Call(callee, args) = &expr.kind {
-        if let Some(first) = args.first() {
-            if let hir::ExprKind::Match(scrutinee, _, hir::MatchSource::TryDesugar(_)) = &first.kind
-            {
-                return unwrap_try_expr(scrutinee);
-            }
+        if let Some(first) = args.first()
+            && let hir::ExprKind::Match(scrutinee, _, hir::MatchSource::TryDesugar(_)) = &first.kind
+        {
+            return unwrap_try_expr(scrutinee);
         }
         if args.len() == 1
             && path_tail_name(callee).is_some_and(|name| {
@@ -2258,11 +2314,7 @@ fn extract_standalone_closure_signature(
 
     // When the signature returns Any (Value) or MultiValue, try to infer concrete types from body
     let body = tcx.hir_body(closure.body);
-    if let Some(inferred) = infer_multi_returns_from_body(tcx, body.value) {
-        if should_replace_returns(&returns, &inferred) {
-            returns = inferred;
-        }
-    }
+    merge_inferred_returns(&mut returns, infer_multi_returns_from_body(tcx, body.value));
 
     let mut params = params;
     refine_params_from_explicit_types(tcx, &closure_snippet, body, 1, 0, &mut params);
@@ -2293,6 +2345,111 @@ fn extract_standalone_closure_signature(
             "extract_standalone_closure_signature final params={params:?} returns={returns:?} closure={closure_snippet}"
         ));
     }
+
+    Some((params, returns))
+}
+
+/// Extract params and returns from a named function reference used as an mlua
+/// callback, e.g. `lua.create_function(hostname)?` where `hostname` is:
+/// ```ignore
+/// fn hostname(_lua: &Lua, _: ()) -> mlua::Result<String> { ... }
+/// ```
+fn extract_named_fn_callback_signature<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+) -> Option<(Vec<LuaParam>, Vec<LuaReturn>)> {
+    // Resolve the expression to a function DefId
+    let def_id = match &expr.kind {
+        hir::ExprKind::Path(qpath) => {
+            let typeck = tcx.typeck(expr.hir_id.owner.def_id);
+            let res = typeck.qpath_res(qpath, expr.hir_id);
+            match res {
+                rustc_hir::def::Res::Def(rustc_hir::def::DefKind::Fn, def_id) => def_id,
+                rustc_hir::def::Res::Def(rustc_hir::def::DefKind::AssocFn, def_id) => def_id,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+
+    // Get the function signature from the type system
+    let sig = tcx.fn_sig(def_id).skip_binder();
+    let sig = tcx.liberate_late_bound_regions(def_id, sig);
+
+    let inputs = sig.inputs();
+    // mlua callback pattern: fn(_lua: &Lua, params) -> Result<Return>
+    // Skip the first arg (&Lua), extract from the second
+    if inputs.len() < 2 {
+        return None;
+    }
+
+    let param_ty = inputs[1];
+    let params = match param_ty.kind() {
+        // () → no params
+        ty::TyKind::Tuple(fields) if fields.is_empty() => Vec::new(),
+        // (P1, P2, ...) → multiple params
+        ty::TyKind::Tuple(fields) => {
+            // Try to get param names from the HIR body if local
+            let hir_names = def_id
+                .as_local()
+                .and_then(|local| {
+                    let node = tcx.hir_node_by_def_id(local);
+                    match node {
+                        rustc_hir::Node::Item(item) => {
+                            if let hir::ItemKind::Fn { body, .. } = item.kind {
+                                let body = tcx.hir_body(body);
+                                // Second param is the args tuple
+                                body.params.get(1).map(|p| extract_names_from_pat(p.pat))
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    }
+                })
+                .unwrap_or_default();
+
+            fields
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    let ty = map_ty_to_lua(tcx, t);
+                    let name = hir_names
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| format!("p{}", i + 1));
+                    LuaParam { name, ty }
+                })
+                .collect()
+        }
+        // Single non-tuple param
+        _ => {
+            let ty = map_ty_to_lua(tcx, param_ty);
+            let name = def_id
+                .as_local()
+                .and_then(|local| {
+                    let node = tcx.hir_node_by_def_id(local);
+                    match node {
+                        rustc_hir::Node::Item(item) => {
+                            if let hir::ItemKind::Fn { body, .. } = item.kind {
+                                let body = tcx.hir_body(body);
+                                body.params
+                                    .get(1)
+                                    .and_then(|p| extract_names_from_pat(p.pat).into_iter().next())
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    }
+                })
+                .unwrap_or_else(|| "p1".to_string());
+            vec![LuaParam { name, ty }]
+        }
+    };
+
+    let ret_ty = sig.output();
+    let returns = map_return_ty(tcx, ret_ty);
 
     Some((params, returns))
 }
@@ -2367,14 +2524,31 @@ fn type_display_name(tcx: TyCtxt<'_>, ty: ty::Ty<'_>) -> String {
 
 fn enclosing_impl_self_type_name(tcx: TyCtxt<'_>, mut local: LocalDefId) -> Option<String> {
     loop {
+        // Stop at the crate root — it has no parent.
+        if local == rustc_hir::def_id::CRATE_DEF_ID {
+            return None;
+        }
         let parent = tcx.local_parent(local);
         if parent == local {
             return None;
         }
 
-        let self_ty = tcx.type_of(parent).skip_binder();
-        if let ty::TyKind::Adt(..) = self_ty.kind() {
-            return Some(type_display_name(tcx, self_ty));
+        // Only call type_of on defs that have types; modules, functions, etc.
+        // will ICE if queried for type_of.
+        let def_kind = tcx.def_kind(parent);
+        let has_self_ty = matches!(
+            def_kind,
+            rustc_hir::def::DefKind::Impl { .. }
+                | rustc_hir::def::DefKind::Struct
+                | rustc_hir::def::DefKind::Enum
+                | rustc_hir::def::DefKind::Union
+        );
+
+        if has_self_ty {
+            let self_ty = tcx.type_of(parent).skip_binder();
+            if let ty::TyKind::Adt(..) = self_ty.kind() {
+                return Some(type_display_name(tcx, self_ty));
+            }
         }
 
         local = parent;
@@ -2399,53 +2573,10 @@ fn visit_expr_for_methods<'tcx>(
     methods: &mut Vec<LuaMethod>,
 ) {
     match &expr.kind {
-        hir::ExprKind::Block(block, _) => {
-            for stmt in block.stmts {
-                match &stmt.kind {
-                    hir::StmtKind::Semi(e) | hir::StmtKind::Expr(e) => {
-                        visit_expr_for_methods(tcx, e, methods);
-                    }
-                    hir::StmtKind::Let(local) => {
-                        if let Some(init) = local.init {
-                            visit_expr_for_methods(tcx, init, methods);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            if let Some(e) = block.expr {
-                visit_expr_for_methods(tcx, e, methods);
-            }
-        }
-        // Walk into if/match/let blocks to find conditional method registrations
-        hir::ExprKind::If(cond, then_block, else_block) => {
-            visit_expr_for_methods(tcx, cond, methods);
-            visit_expr_for_methods(tcx, then_block, methods);
-            if let Some(else_expr) = else_block {
-                visit_expr_for_methods(tcx, else_expr, methods);
-            }
-        }
-        hir::ExprKind::Match(scrutinee, arms, _) => {
-            visit_expr_for_methods(tcx, scrutinee, methods);
-            for arm in *arms {
-                visit_expr_for_methods(tcx, arm.body, methods);
-            }
-        }
-        // Walk into loop bodies
-        hir::ExprKind::Loop(block, _, _, _) => {
-            walk_loop_body!(block, |e| visit_expr_for_methods(tcx, e, methods));
-        }
         // Walk into closure bodies (e.g. immediately-invoked closures)
         hir::ExprKind::Closure(closure) => {
             let body = tcx.hir_body(closure.body);
             visit_expr_for_methods(tcx, body.value, methods);
-        }
-        // Walk into call args (handles IIFE patterns and chained calls)
-        hir::ExprKind::Call(callee, args) => {
-            visit_expr_for_methods(tcx, callee, methods);
-            for arg in *args {
-                visit_expr_for_methods(tcx, arg, methods);
-            }
         }
         hir::ExprKind::MethodCall(segment, _receiver, args, _span) => {
             let method_name = segment.ident.name.as_str();
@@ -2468,7 +2599,8 @@ fn visit_expr_for_methods<'tcx>(
                 | "add_async_method"
                 | "add_async_method_mut"
                 | "add_async_method_once" => {
-                    if let Some(m) = extract_single_method(tcx, args, MethodKind::Method, is_async)
+                    if let Some(m) =
+                        extract_registered_method(tcx, args, MethodKind::Method, is_async)
                     {
                         methods.push(m);
                     }
@@ -2476,7 +2608,7 @@ fn visit_expr_for_methods<'tcx>(
                 // All function variants (immutable, mutable, async)
                 "add_function" | "add_function_mut" | "add_async_function" => {
                     if let Some(m) =
-                        extract_single_method(tcx, args, MethodKind::Function, is_async)
+                        extract_registered_method(tcx, args, MethodKind::Function, is_async)
                     {
                         methods.push(m);
                     }
@@ -2500,11 +2632,15 @@ fn visit_expr_for_methods<'tcx>(
                 _ => {}
             }
         }
-        _ => {}
+        _ => {
+            visit_recursive_expr_children(expr, |child| {
+                visit_expr_for_methods(tcx, child, methods);
+            });
+        }
     }
 }
 
-fn extract_single_method<'tcx>(
+fn extract_registered_method<'tcx>(
     tcx: TyCtxt<'tcx>,
     args: &'tcx [hir::Expr<'tcx>],
     kind: MethodKind,
@@ -2520,7 +2656,7 @@ fn extract_single_method<'tcx>(
 
     if should_trace_method_name(&name) {
         trace(format!(
-            "extract_single_method name={name} kind={kind:?} params={params:?} returns={returns:?} closure={}",
+            "extract_registered_method name={name} kind={kind:?} params={params:?} returns={returns:?} closure={}",
             expr_snippet(tcx, closure_expr)
         ));
     }
@@ -2547,7 +2683,14 @@ fn extract_meta_method<'tcx>(
 
     let name = extract_meta_method_name(tcx, args.first()?)?;
     let closure_expr = args.get(1)?;
-    let (params, returns) = extract_closure_signature(tcx, closure_expr, kind)?;
+    let (params, mut returns) = extract_closure_signature(tcx, closure_expr, kind)?;
+
+    if name == "__pairs"
+        && let Some(inferred) = infer_forwarded_pairs_returns_from_closure(tcx, closure_expr)
+        && should_replace_returns(&returns, &inferred)
+    {
+        returns = inferred;
+    }
 
     if should_trace_method_name(&name) {
         trace(format!(
@@ -2566,11 +2709,73 @@ fn extract_meta_method<'tcx>(
     })
 }
 
-fn extract_string_literal(expr: &hir::Expr<'_>) -> Option<String> {
-    if let hir::ExprKind::Lit(lit) = &expr.kind {
-        if let rustc_ast::ast::LitKind::Str(sym, _) = &lit.node {
-            return Some(sym.as_str().to_string());
+fn infer_forwarded_pairs_returns_from_closure<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    closure_expr: &'tcx hir::Expr<'tcx>,
+) -> Option<Vec<LuaReturn>> {
+    let hir::ExprKind::Closure(closure) = &closure_expr.kind else {
+        return None;
+    };
+
+    let body = tcx.hir_body(closure.body);
+    find_forwarded_pairs_returns_in_expr(tcx, body.value)
+}
+
+fn find_forwarded_pairs_returns_in_expr<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+) -> Option<Vec<LuaReturn>> {
+    let expr = peel_expr(peel_try_expr(expr));
+
+    match &expr.kind {
+        hir::ExprKind::MethodCall(segment, _receiver, args, _) => {
+            infer_forwarded_multivalue_returns(tcx, expr, segment, args)
         }
+        hir::ExprKind::Block(block, _) => block
+            .stmts
+            .iter()
+            .find_map(|stmt| match &stmt.kind {
+                hir::StmtKind::Let(local) => local
+                    .init
+                    .and_then(|init| find_forwarded_pairs_returns_in_expr(tcx, init)),
+                hir::StmtKind::Expr(expr) | hir::StmtKind::Semi(expr) => {
+                    find_forwarded_pairs_returns_in_expr(tcx, expr)
+                }
+                _ => None,
+            })
+            .or_else(|| {
+                block
+                    .expr
+                    .and_then(|expr| find_forwarded_pairs_returns_in_expr(tcx, expr))
+            }),
+        hir::ExprKind::Match(scrutinee, arms, _) => {
+            find_forwarded_pairs_returns_in_expr(tcx, scrutinee).or_else(|| {
+                arms.iter()
+                    .find_map(|arm| find_forwarded_pairs_returns_in_expr(tcx, arm.body))
+            })
+        }
+        hir::ExprKind::If(cond, then_expr, else_expr) => {
+            find_forwarded_pairs_returns_in_expr(tcx, cond)
+                .or_else(|| find_forwarded_pairs_returns_in_expr(tcx, then_expr))
+                .or_else(|| {
+                    else_expr.and_then(|expr| find_forwarded_pairs_returns_in_expr(tcx, expr))
+                })
+        }
+        hir::ExprKind::Ret(Some(inner)) => find_forwarded_pairs_returns_in_expr(tcx, inner),
+        hir::ExprKind::Call(callee, args) => find_forwarded_pairs_returns_in_expr(tcx, callee)
+            .or_else(|| {
+                args.iter()
+                    .find_map(|arg| find_forwarded_pairs_returns_in_expr(tcx, arg))
+            }),
+        _ => None,
+    }
+}
+
+fn extract_string_literal(expr: &hir::Expr<'_>) -> Option<String> {
+    if let hir::ExprKind::Lit(lit) = &expr.kind
+        && let rustc_ast::ast::LitKind::Str(sym, _) = &lit.node
+    {
+        return Some(sym.as_str().to_string());
     }
     None
 }
@@ -2720,7 +2925,10 @@ fn infer_local_table_binding_type<'tcx>(
         return None;
     };
 
-    if !matches!(segment.ident.name.as_str(), "create_table" | "create_table_with_capacity") {
+    if !matches!(
+        segment.ident.name.as_str(),
+        "create_table" | "create_table_with_capacity"
+    ) {
         return None;
     }
 
@@ -2752,7 +2960,11 @@ fn collect_table_binding_value_types<'tcx>(
             {
                 tys.push(infer_value_expr_lua_type(tcx, &args[1]));
             }
-            tys.extend(collect_table_binding_value_types(tcx, receiver, binding_name));
+            tys.extend(collect_table_binding_value_types(
+                tcx,
+                receiver,
+                binding_name,
+            ));
             for arg in *args {
                 tys.extend(collect_table_binding_value_types(tcx, arg, binding_name));
             }
@@ -2788,15 +3000,27 @@ fn collect_table_binding_value_types<'tcx>(
         hir::ExprKind::Match(scrutinee, arms, _) => {
             let mut tys = collect_table_binding_value_types(tcx, scrutinee, binding_name);
             for arm in *arms {
-                tys.extend(collect_table_binding_value_types(tcx, arm.body, binding_name));
+                tys.extend(collect_table_binding_value_types(
+                    tcx,
+                    arm.body,
+                    binding_name,
+                ));
             }
             tys
         }
         hir::ExprKind::If(cond, then_expr, else_expr) => {
             let mut tys = collect_table_binding_value_types(tcx, cond, binding_name);
-            tys.extend(collect_table_binding_value_types(tcx, then_expr, binding_name));
+            tys.extend(collect_table_binding_value_types(
+                tcx,
+                then_expr,
+                binding_name,
+            ));
             if let Some(else_expr) = else_expr {
-                tys.extend(collect_table_binding_value_types(tcx, else_expr, binding_name));
+                tys.extend(collect_table_binding_value_types(
+                    tcx,
+                    else_expr,
+                    binding_name,
+                ));
             }
             tys
         }
@@ -2805,12 +3029,16 @@ fn collect_table_binding_value_types<'tcx>(
             tys.extend(collect_table_binding_value_types(tcx, rhs, binding_name));
             tys
         }
-        hir::ExprKind::Let(let_expr) => collect_table_binding_value_types(tcx, let_expr.init, binding_name),
+        hir::ExprKind::Let(let_expr) => {
+            collect_table_binding_value_types(tcx, let_expr.init, binding_name)
+        }
         hir::ExprKind::Array(items) | hir::ExprKind::Tup(items) => items
             .iter()
             .flat_map(|item| collect_table_binding_value_types(tcx, item, binding_name))
             .collect(),
-        hir::ExprKind::Ret(Some(inner)) => collect_table_binding_value_types(tcx, inner, binding_name),
+        hir::ExprKind::Ret(Some(inner)) => {
+            collect_table_binding_value_types(tcx, inner, binding_name)
+        }
         hir::ExprKind::Closure(closure) => {
             let body = tcx.hir_body(closure.body);
             collect_table_binding_value_types(tcx, body.value, binding_name)
@@ -2834,30 +3062,10 @@ fn find_binding_init_in_expr<'tcx>(
                 .expr
                 .and_then(|tail| find_binding_init_in_expr(tail, target))
         }
-        hir::ExprKind::If(cond, then_expr, else_expr) => find_binding_init_in_expr(cond, target)
-            .or_else(|| find_binding_init_in_expr(then_expr, target))
-            .or_else(|| {
-                else_expr.and_then(|else_expr| find_binding_init_in_expr(else_expr, target))
-            }),
-        hir::ExprKind::Match(scrutinee, arms, _) => find_binding_init_in_expr(scrutinee, target)
-            .or_else(|| {
-                arms.iter()
-                    .find_map(|arm| find_binding_init_in_expr(arm.body, target))
-            }),
-        hir::ExprKind::Call(callee, args) => {
-            find_binding_init_in_expr(callee, target).or_else(|| {
-                args.iter()
-                    .find_map(|arg| find_binding_init_in_expr(arg, target))
-            })
-        }
-        hir::ExprKind::MethodCall(_, receiver, args, _) => {
-            find_binding_init_in_expr(receiver, target).or_else(|| {
-                args.iter()
-                    .find_map(|arg| find_binding_init_in_expr(arg, target))
-            })
-        }
         hir::ExprKind::Closure(_) => None,
-        _ => None,
+        _ => {
+            find_in_recursive_expr_children(expr, |child| find_binding_init_in_expr(child, target))
+        }
     }
 }
 
@@ -2915,7 +3123,9 @@ fn infer_local_fn_body_return<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> Op
     let concrete = infer_concrete_type_from_body(tcx, body.value);
 
     match (inferred, concrete) {
-        (Some(existing), Some(candidate)) if should_prefer_body_inference(&existing, &candidate) => {
+        (Some(existing), Some(candidate))
+            if should_prefer_body_inference(&existing, &candidate) =>
+        {
             Some(rewrap_erased_body_inference(&existing, &candidate))
         }
         (Some(existing), _) => Some(existing),
@@ -3027,7 +3237,8 @@ fn infer_field_closure_result<'tcx>(
             let name = segment.ident.name.as_str();
             if matches!(name, "map" | "and_then") {
                 let typeck = tcx.typeck(expr.hir_id.owner.def_id);
-                if let Some(mapped) = infer_mapped_method_result(tcx, typeck, receiver, args, name) {
+                if let Some(mapped) = infer_mapped_method_result(tcx, typeck, receiver, args, name)
+                {
                     return Some(mapped);
                 }
             }
@@ -3080,7 +3291,9 @@ fn infer_field_closure_result<'tcx>(
         }
         hir::ExprKind::If(_, then_expr, else_expr) => {
             let mut best = infer_field_closure_result(tcx, then_expr);
-            if let Some(else_expr) = else_expr.and_then(|expr| infer_field_closure_result(tcx, expr)) {
+            if let Some(else_expr) =
+                else_expr.and_then(|expr| infer_field_closure_result(tcx, expr))
+            {
                 best = merge_body_inference(best, else_expr);
             }
             best
@@ -3109,7 +3322,9 @@ fn infer_field_closure_result<'tcx>(
                 if let Some(candidate) = inferred {
                     let typeck = tcx.typeck(expr.hir_id.owner.def_id);
                     let existing = map_ty_to_lua(tcx, typeck.expr_ty(expr));
-                    if should_prefer_body_inference(&existing, &candidate) || !is_informative(&existing) {
+                    if should_prefer_body_inference(&existing, &candidate)
+                        || !is_informative(&existing)
+                    {
                         return Some(rewrap_erased_body_inference(&existing, &candidate));
                     }
                 }
@@ -3140,7 +3355,8 @@ fn explicit_lua_type_from_body_param(
 
     let snippet = tcx.sess.source_map().span_to_snippet(param.ty_span).ok()?;
     let snippet = snippet.trim();
-    (!snippet.is_empty()).then(|| normalize_explicit_param_type(lua_type_from_extracted_name(snippet.to_string())))
+    (!snippet.is_empty())
+        .then(|| normalize_explicit_param_type(lua_type_from_extracted_name(snippet)))
 }
 
 fn infer_local_callable_param_type<'tcx>(
@@ -3259,9 +3475,17 @@ fn extract_closure_signature(
     kind: MethodKind,
 ) -> Option<(Vec<LuaParam>, Vec<LuaReturn>)> {
     let closure_snippet = expr_snippet(tcx, closure_expr);
-    let trace_target = ["ends_with", "join", "starts_with", "strip_prefix", "raw", "UrlRef", "PathRef"]
-        .iter()
-        .any(|name| closure_snippet.contains(name));
+    let trace_target = [
+        "ends_with",
+        "join",
+        "starts_with",
+        "strip_prefix",
+        "raw",
+        "UrlRef",
+        "PathRef",
+    ]
+    .iter()
+    .any(|name| closure_snippet.contains(name));
     let hir::ExprKind::Closure(closure) = &closure_expr.kind else {
         return None;
     };
@@ -3340,19 +3564,20 @@ fn extract_closure_signature(
                     explicit_lua_params_from_hir(tcx, body, params_idx)
                         .map(|params| params.into_iter().skip(1).collect())
                         .unwrap_or_else(|| {
-                        let rest_names: Vec<String> = hir_param_names.iter().skip(1).cloned().collect();
-                        fields
-                            .iter()
-                            .skip(1)
-                            .enumerate()
-                            .map(|(i, field_ty)| LuaParam {
-                                name: rest_names
-                                    .get(i)
-                                    .cloned()
-                                    .unwrap_or_else(|| format!("p{}", i + 1)),
-                                ty: map_ty_to_lua(tcx, field_ty),
-                            })
-                            .collect()
+                            let rest_names: Vec<String> =
+                                hir_param_names.iter().skip(1).cloned().collect();
+                            fields
+                                .iter()
+                                .skip(1)
+                                .enumerate()
+                                .map(|(i, field_ty)| LuaParam {
+                                    name: rest_names
+                                        .get(i)
+                                        .cloned()
+                                        .unwrap_or_else(|| format!("p{}", i + 1)),
+                                    ty: map_ty_to_lua(tcx, field_ty),
+                                })
+                                .collect()
                         })
                 } else {
                     // Single AnyUserData param → no Lua-visible params
@@ -3367,11 +3592,10 @@ fn extract_closure_signature(
                     map_return_ty(tcx, sig.output())
                 };
 
-                if let Some(inferred) = infer_multi_returns_from_body(tcx, body.value) {
-                    if should_replace_returns(&returns, &inferred) {
-                        returns = inferred;
-                    }
-                }
+                merge_inferred_returns(
+                    &mut returns,
+                    infer_multi_returns_from_body(tcx, body.value),
+                );
 
                 let mut params = params;
                 refine_params_from_explicit_types(
@@ -3412,11 +3636,7 @@ fn extract_closure_signature(
 
     // When the signature returns Any (Value) or MultiValue, try to infer concrete types from body
     let body = tcx.hir_body(closure.body);
-    if let Some(inferred) = infer_multi_returns_from_body(tcx, body.value) {
-        if should_replace_returns(&returns, &inferred) {
-            returns = inferred;
-        }
-    }
+    merge_inferred_returns(&mut returns, infer_multi_returns_from_body(tcx, body.value));
 
     let mut params = params;
     refine_params_from_explicit_types(tcx, &closure_snippet, body, params_idx, 0, &mut params);
@@ -3499,12 +3719,17 @@ fn refine_params_from_explicit_types<'tcx>(
     }
 
     let explicit_types = explicit_param_types_from_body_param(tcx, body, params_idx, params.len())
-        .or_else(|| explicit_param_types_from_closure_snippet(closure_snippet, params_idx, params.len()));
+        .or_else(|| {
+            explicit_param_types_from_closure_snippet(closure_snippet, params_idx, params.len())
+        });
     let Some(explicit_types) = explicit_types else {
         return;
     };
 
-    for (param, explicit) in params.iter_mut().zip(explicit_types.into_iter().skip(skip_leading)) {
+    for (param, explicit) in params
+        .iter_mut()
+        .zip(explicit_types.into_iter().skip(skip_leading))
+    {
         if should_prefer_explicit_param_type(&param.ty, &explicit) {
             param.ty = explicit;
         }
@@ -3567,7 +3792,10 @@ fn explicit_param_types_from_closure_snippet(
     explicit_param_types_from_type_snippet(ty, expected_len)
 }
 
-fn explicit_param_types_from_type_snippet(snippet: &str, expected_len: usize) -> Option<Vec<LuaType>> {
+fn explicit_param_types_from_type_snippet(
+    snippet: &str,
+    expected_len: usize,
+) -> Option<Vec<LuaType>> {
     let snippet = snippet.trim();
     if snippet.is_empty() {
         return None;
@@ -3578,17 +3806,19 @@ fn explicit_param_types_from_type_snippet(snippet: &str, expected_len: usize) ->
     }
 
     if expected_len == 1 {
-        return Some(vec![normalize_explicit_param_type(lua_type_from_extracted_name(
-            snippet.to_string(),
-        ))]);
+        return Some(vec![normalize_explicit_param_type(
+            lua_type_from_extracted_name(snippet),
+        )]);
     }
 
-    let inner = snippet.strip_prefix('(').and_then(|s| s.strip_suffix(')'))?;
+    let inner = snippet
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))?;
     let parts = split_top_level(inner, ',');
     (parts.len() == expected_len).then(|| {
         parts
             .into_iter()
-            .map(|part| normalize_explicit_param_type(lua_type_from_extracted_name(part.to_string())))
+            .map(|part| normalize_explicit_param_type(lua_type_from_extracted_name(part)))
             .collect()
     })
 }
@@ -3656,7 +3886,9 @@ fn normalize_param_lua_type(ty: LuaType) -> LuaType {
             Box::new(normalize_param_lua_type(*key)),
             Box::new(normalize_param_lua_type(*value)),
         ),
-        LuaType::Union(items) => make_union(items.into_iter().map(normalize_param_lua_type).collect()),
+        LuaType::Union(items) => {
+            make_union(items.into_iter().map(normalize_param_lua_type).collect())
+        }
         LuaType::Variadic(inner) => LuaType::Variadic(Box::new(normalize_param_lua_type(*inner))),
         LuaType::FunctionSig { params, returns } => LuaType::FunctionSig {
             params: params.into_iter().map(normalize_param_lua_type).collect(),
@@ -3732,7 +3964,11 @@ fn infer_param_type_from_body<'tcx>(
                     tys.push(ty);
                 }
             }
-            if tys.is_empty() { None } else { Some(make_union(tys)) }
+            if tys.is_empty() {
+                None
+            } else {
+                Some(make_union(tys))
+            }
         }
         hir::ExprKind::Block(block, _) => block
             .stmts
@@ -3759,10 +3995,16 @@ fn infer_param_type_from_body<'tcx>(
             if let Some(ty) = infer_param_type_from_body(tcx, then_expr, param_name) {
                 tys.push(ty);
             }
-            if let Some(ty) = else_expr.and_then(|expr| infer_param_type_from_body(tcx, expr, param_name)) {
+            if let Some(ty) =
+                else_expr.and_then(|expr| infer_param_type_from_body(tcx, expr, param_name))
+            {
                 tys.push(ty);
             }
-            if tys.is_empty() { None } else { Some(make_union(tys)) }
+            if tys.is_empty() {
+                None
+            } else {
+                Some(make_union(tys))
+            }
         }
         hir::ExprKind::Call(callee, args) => infer_param_type_from_body(tcx, callee, param_name)
             .or_else(|| {
@@ -3798,7 +4040,9 @@ fn infer_param_type_from_body<'tcx>(
             .iter()
             .find_map(|field| infer_param_type_from_body(tcx, field.expr, param_name))
             .or_else(|| match tail {
-                hir::StructTailExpr::Base(base) => infer_param_type_from_body(tcx, base, param_name),
+                hir::StructTailExpr::Base(base) => {
+                    infer_param_type_from_body(tcx, base, param_name)
+                }
                 _ => None,
             }),
         hir::ExprKind::Array(items) => items
@@ -3833,7 +4077,8 @@ fn tuple_scrutinee_param_positions(expr: &hir::Expr<'_>, param_name: &str) -> Ve
         return Vec::new();
     };
 
-    items.iter()
+    items
+        .iter()
         .enumerate()
         .filter_map(|(index, item)| {
             let name = path_tail_name(item).or_else(|| string_bytes_binding_name(item));
@@ -3842,7 +4087,11 @@ fn tuple_scrutinee_param_positions(expr: &hir::Expr<'_>, param_name: &str) -> Ve
         .collect()
 }
 
-fn tuple_arm_param_type(tcx: TyCtxt<'_>, pat: &hir::Pat<'_>, positions: &[usize]) -> Option<LuaType> {
+fn tuple_arm_param_type(
+    tcx: TyCtxt<'_>,
+    pat: &hir::Pat<'_>,
+    positions: &[usize],
+) -> Option<LuaType> {
     let hir::PatKind::Tuple(pats, _) = &pat.kind else {
         return None;
     };
@@ -3866,7 +4115,10 @@ fn string_literal_from_pat(tcx: TyCtxt<'_>, pat: &hir::Pat<'_>) -> Option<String
     let snippet = tcx.sess.source_map().span_to_snippet(pat.span).ok()?;
     let snippet = snippet.trim();
 
-    if let Some(value) = snippet.strip_prefix("b\"").and_then(|s| s.strip_suffix('"')) {
+    if let Some(value) = snippet
+        .strip_prefix("b\"")
+        .and_then(|s| s.strip_suffix('"'))
+    {
         Some(value.to_string())
     } else {
         snippet
@@ -3953,6 +4205,7 @@ fn infer_sequence_values_item_type<'tcx>(
                         &expr_snippet(tcx, expr),
                         "sequence_values::<",
                     )
+                    .as_deref()
                     .map(lua_type_from_extracted_name);
                 };
                 let hir::TyKind::Path(qpath) = &ty.kind else {
@@ -3960,6 +4213,7 @@ fn infer_sequence_values_item_type<'tcx>(
                         &expr_snippet(tcx, expr),
                         "sequence_values::<",
                     )
+                    .as_deref()
                     .map(lua_type_from_extracted_name);
                 };
 
@@ -3967,6 +4221,7 @@ fn infer_sequence_values_item_type<'tcx>(
                     .or_else(|| {
                         snippet_generic_type_name(&expr_snippet(tcx, expr), "sequence_values::<")
                     })
+                    .as_deref()
                     .map(lua_type_from_extracted_name);
             }
 
@@ -3978,18 +4233,28 @@ fn infer_sequence_values_item_type<'tcx>(
                     .find_map(|arg| infer_sequence_values_item_type(tcx, arg, binding_name))
             })
         }
-        hir::ExprKind::Assign(lhs, rhs, _) => infer_sequence_values_item_type(tcx, lhs, binding_name)
-            .or_else(|| infer_sequence_values_item_type(tcx, rhs, binding_name)),
-        hir::ExprKind::AssignOp(_, lhs, rhs) => infer_sequence_values_item_type(tcx, lhs, binding_name)
-            .or_else(|| infer_sequence_values_item_type(tcx, rhs, binding_name)),
-        hir::ExprKind::Binary(_, lhs, rhs) => infer_sequence_values_item_type(tcx, lhs, binding_name)
-            .or_else(|| infer_sequence_values_item_type(tcx, rhs, binding_name)),
-        hir::ExprKind::Let(let_expr) => infer_sequence_values_item_type(tcx, let_expr.init, binding_name),
+        hir::ExprKind::Assign(lhs, rhs, _) => {
+            infer_sequence_values_item_type(tcx, lhs, binding_name)
+                .or_else(|| infer_sequence_values_item_type(tcx, rhs, binding_name))
+        }
+        hir::ExprKind::AssignOp(_, lhs, rhs) => {
+            infer_sequence_values_item_type(tcx, lhs, binding_name)
+                .or_else(|| infer_sequence_values_item_type(tcx, rhs, binding_name))
+        }
+        hir::ExprKind::Binary(_, lhs, rhs) => {
+            infer_sequence_values_item_type(tcx, lhs, binding_name)
+                .or_else(|| infer_sequence_values_item_type(tcx, rhs, binding_name))
+        }
+        hir::ExprKind::Let(let_expr) => {
+            infer_sequence_values_item_type(tcx, let_expr.init, binding_name)
+        }
         hir::ExprKind::Struct(_, fields, tail) => fields
             .iter()
             .find_map(|field| infer_sequence_values_item_type(tcx, field.expr, binding_name))
             .or_else(|| match tail {
-                hir::StructTailExpr::Base(base) => infer_sequence_values_item_type(tcx, base, binding_name),
+                hir::StructTailExpr::Base(base) => {
+                    infer_sequence_values_item_type(tcx, base, binding_name)
+                }
                 _ => None,
             }),
         hir::ExprKind::Match(scrutinee, arms, _) => {
@@ -4065,10 +4330,18 @@ fn collect_userdata_binding_types_from_body<'tcx>(
                 types.push(LuaType::Class(name));
             }
 
-            types.extend(collect_userdata_binding_types_from_body(tcx, receiver, binding_name));
+            types.extend(collect_userdata_binding_types_from_body(
+                tcx,
+                receiver,
+                binding_name,
+            ));
             if let hir::ExprKind::MethodCall(_, _, args, _) = &expr.kind {
                 for arg in *args {
-                    types.extend(collect_userdata_binding_types_from_body(tcx, arg, binding_name));
+                    types.extend(collect_userdata_binding_types_from_body(
+                        tcx,
+                        arg,
+                        binding_name,
+                    ));
                 }
             }
             types
@@ -4077,25 +4350,43 @@ fn collect_userdata_binding_types_from_body<'tcx>(
             let mut types = Vec::new();
 
             if let Some(name) = callee_try_from_type_name(tcx, callee)
-                && args.first().is_some_and(|arg| expr_refers_to_binding(arg, binding_name))
+                && args
+                    .first()
+                    .is_some_and(|arg| expr_refers_to_binding(arg, binding_name))
             {
                 types.push(LuaType::Class(name));
             }
 
-            types.extend(collect_userdata_binding_types_from_body(tcx, callee, binding_name));
+            types.extend(collect_userdata_binding_types_from_body(
+                tcx,
+                callee,
+                binding_name,
+            ));
             for arg in *args {
-                types.extend(collect_userdata_binding_types_from_body(tcx, arg, binding_name));
+                types.extend(collect_userdata_binding_types_from_body(
+                    tcx,
+                    arg,
+                    binding_name,
+                ));
             }
             types
         }
         hir::ExprKind::Assign(lhs, rhs, _) | hir::ExprKind::AssignOp(_, lhs, rhs) => {
             let mut types = collect_userdata_binding_types_from_body(tcx, lhs, binding_name);
-            types.extend(collect_userdata_binding_types_from_body(tcx, rhs, binding_name));
+            types.extend(collect_userdata_binding_types_from_body(
+                tcx,
+                rhs,
+                binding_name,
+            ));
             types
         }
         hir::ExprKind::Binary(_, lhs, rhs) => {
             let mut types = collect_userdata_binding_types_from_body(tcx, lhs, binding_name);
-            types.extend(collect_userdata_binding_types_from_body(tcx, rhs, binding_name));
+            types.extend(collect_userdata_binding_types_from_body(
+                tcx,
+                rhs,
+                binding_name,
+            ));
             types
         }
         hir::ExprKind::Let(let_expr) => {
@@ -4103,16 +4394,24 @@ fn collect_userdata_binding_types_from_body<'tcx>(
         }
         hir::ExprKind::Struct(_, fields, tail) => fields
             .iter()
-            .flat_map(|field| collect_userdata_binding_types_from_body(tcx, field.expr, binding_name))
+            .flat_map(|field| {
+                collect_userdata_binding_types_from_body(tcx, field.expr, binding_name)
+            })
             .chain(match tail {
-                hir::StructTailExpr::Base(base) => collect_userdata_binding_types_from_body(tcx, base, binding_name),
+                hir::StructTailExpr::Base(base) => {
+                    collect_userdata_binding_types_from_body(tcx, base, binding_name)
+                }
                 _ => Vec::new(),
             })
             .collect(),
         hir::ExprKind::Match(scrutinee, arms, _) => {
             let mut types = collect_userdata_binding_types_from_body(tcx, scrutinee, binding_name);
             for arm in *arms {
-                types.extend(collect_userdata_binding_types_from_body(tcx, arm.body, binding_name));
+                types.extend(collect_userdata_binding_types_from_body(
+                    tcx,
+                    arm.body,
+                    binding_name,
+                ));
             }
             types
         }
@@ -4130,21 +4429,30 @@ fn collect_userdata_binding_types_from_body<'tcx>(
                 _ => Vec::new(),
             })
             .chain(
-                block
-                    .expr
-                    .into_iter()
-                    .flat_map(|expr| collect_userdata_binding_types_from_body(tcx, expr, binding_name)),
+                block.expr.into_iter().flat_map(|expr| {
+                    collect_userdata_binding_types_from_body(tcx, expr, binding_name)
+                }),
             )
             .collect(),
         hir::ExprKind::If(cond, then_expr, else_expr) => {
             let mut types = collect_userdata_binding_types_from_body(tcx, cond, binding_name);
-            types.extend(collect_userdata_binding_types_from_body(tcx, then_expr, binding_name));
+            types.extend(collect_userdata_binding_types_from_body(
+                tcx,
+                then_expr,
+                binding_name,
+            ));
             if let Some(else_expr) = else_expr {
-                types.extend(collect_userdata_binding_types_from_body(tcx, else_expr, binding_name));
+                types.extend(collect_userdata_binding_types_from_body(
+                    tcx,
+                    else_expr,
+                    binding_name,
+                ));
             }
             types
         }
-        hir::ExprKind::Ret(Some(inner)) => collect_userdata_binding_types_from_body(tcx, inner, binding_name),
+        hir::ExprKind::Ret(Some(inner)) => {
+            collect_userdata_binding_types_from_body(tcx, inner, binding_name)
+        }
         hir::ExprKind::Array(items) => items
             .iter()
             .flat_map(|item| collect_userdata_binding_types_from_body(tcx, item, binding_name))
@@ -4161,7 +4469,11 @@ fn expr_refers_to_binding(expr: &hir::Expr<'_>, binding_name: &str) -> bool {
     path_tail_name(expr).as_deref() == Some(binding_name)
 }
 
-fn infer_take_binding_type(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>, binding_name: &str) -> Option<LuaType> {
+fn infer_take_binding_type(
+    tcx: TyCtxt<'_>,
+    expr: &hir::Expr<'_>,
+    binding_name: &str,
+) -> Option<LuaType> {
     let expr = peel_try_expr(expr);
     let hir::ExprKind::MethodCall(segment, receiver, _, _) = &expr.kind else {
         return None;
@@ -4186,7 +4498,9 @@ fn infer_from_value_binding_type(
     };
 
     if segment.ident.name.as_str() != "from_value"
-        || !args.first().is_some_and(|arg| expr_refers_to_binding(arg, binding_name))
+        || !args
+            .first()
+            .is_some_and(|arg| expr_refers_to_binding(arg, binding_name))
     {
         return None;
     }
@@ -4216,8 +4530,12 @@ fn lua_type_from_hir_ty<'hir, A>(ty: &hir::Ty<'hir, A>) -> Option<LuaType> {
             };
 
             match name {
-                "Option" => Some(LuaType::Optional(Box::new(lua_type_from_hir_ty(first_type_arg()?)?))),
-                "Vec" | "VecDeque" => Some(LuaType::Array(Box::new(lua_type_from_hir_ty(first_type_arg()?)?))),
+                "Option" => Some(LuaType::Optional(Box::new(lua_type_from_hir_ty(
+                    first_type_arg()?,
+                )?))),
+                "Vec" | "VecDeque" => Some(LuaType::Array(Box::new(lua_type_from_hir_ty(
+                    first_type_arg()?,
+                )?))),
                 "UserDataRef" | "UserDataRefMut" => lua_type_from_hir_ty(first_type_arg()?),
                 "String" | "str" => Some(LuaType::String),
                 "Integer" => Some(LuaType::Integer),
@@ -4243,16 +4561,37 @@ fn resolved_hir_ty_lua_type<'hir, A>(tcx: TyCtxt<'_>, ty: &hir::Ty<'hir, A>) -> 
         return None;
     };
 
-    let def_id = match qpath {
-        hir::QPath::Resolved(_, path) => path.res.opt_def_id()?,
+    let (res, def_id) = match qpath {
+        hir::QPath::Resolved(_, path) => (path.res, path.res.opt_def_id()?),
         hir::QPath::TypeRelative(_, _) => return None,
     };
 
-    let resolved = type_alias_def_lua_type(tcx, def_id)
-        .or_else(|| {
-            let ty = map_ty_to_lua(tcx, tcx.type_of(def_id).skip_binder());
-            is_informative(&ty).then_some(ty)
-        })?;
+    // Only call type_of on definitions that actually have types (structs,
+    // enums, type aliases, etc.). Modules, consts, and other non-type defs
+    // will ICE if passed to type_of.
+    let has_type = matches!(
+        res,
+        rustc_hir::def::Res::Def(
+            rustc_hir::def::DefKind::Struct
+                | rustc_hir::def::DefKind::Enum
+                | rustc_hir::def::DefKind::Union
+                | rustc_hir::def::DefKind::TyAlias
+                | rustc_hir::def::DefKind::AssocTy
+                | rustc_hir::def::DefKind::ForeignTy
+                | rustc_hir::def::DefKind::OpaqueTy
+                | rustc_hir::def::DefKind::TraitAlias,
+            _
+        ) | rustc_hir::def::Res::SelfTyAlias { .. }
+            | rustc_hir::def::Res::SelfTyParam { .. }
+    );
+
+    let resolved = type_alias_def_lua_type(tcx, def_id).or_else(|| {
+        if !has_type {
+            return None;
+        }
+        let ty = map_ty_to_lua(tcx, tcx.type_of(def_id).skip_binder());
+        is_informative(&ty).then_some(ty)
+    })?;
     let fallback = lua_type_from_hir_ty(ty);
 
     match fallback.as_ref() {
@@ -4277,7 +4616,7 @@ fn type_alias_def_lua_type(tcx: TyCtxt<'_>, def_id: rustc_hir::def_id::DefId) ->
     }
 
     let rhs = snippet[eq + 1..].split(';').next()?.trim();
-    (!rhs.is_empty()).then(|| lua_type_from_extracted_name(rhs.to_string()))
+    (!rhs.is_empty()).then(|| lua_type_from_extracted_name(rhs))
 }
 
 fn lua_type_from_hir_ty_with_snippet<'hir, A>(
@@ -4300,7 +4639,7 @@ fn ty_snippet_to_lua_type<'hir, A>(tcx: TyCtxt<'_>, ty: &hir::Ty<'hir, A>) -> Op
         snippet = rest.trim_start().to_string();
     }
 
-    (!snippet.is_empty()).then(|| lua_type_from_extracted_name(snippet))
+    (!snippet.is_empty()).then(|| lua_type_from_extracted_name(&snippet))
 }
 
 fn method_generic_lua_type(
@@ -4316,29 +4655,31 @@ fn method_generic_lua_type(
     }
 
     let marker = format!("{}::<", segment.ident.name.as_str());
-    snippet_generic_type_name(&expr_snippet(tcx, expr), &marker).map(lua_type_from_extracted_name)
+    snippet_generic_type_name(&expr_snippet(tcx, expr), &marker)
+        .as_deref()
+        .map(lua_type_from_extracted_name)
 }
 
 fn callee_try_from_type_name(tcx: TyCtxt<'_>, callee: &hir::Expr<'_>) -> Option<String> {
     let callee = peel_expr(callee);
     let name = match &callee.kind {
         hir::ExprKind::Path(qpath) => match qpath {
-        hir::QPath::TypeRelative(ty, seg) if seg.ident.name.as_str() == "try_from" => {
-            let hir::TyKind::Path(qpath) = &ty.kind else {
-                return None;
-            };
-            extract_type_name_from_qpath(qpath)
-        }
-        hir::QPath::Resolved(_, path) => {
-            let seg = path.segments.last()?;
-            if seg.ident.name.as_str() != "try_from" {
-                return None;
+            hir::QPath::TypeRelative(ty, seg) if seg.ident.name.as_str() == "try_from" => {
+                let hir::TyKind::Path(qpath) = &ty.kind else {
+                    return None;
+                };
+                extract_type_name_from_qpath(qpath)
             }
-            let prev = path.segments.iter().rev().nth(1)?;
-            Some(prev.ident.name.as_str().to_string())
-        }
-        _ => None,
-    },
+            hir::QPath::Resolved(_, path) => {
+                let seg = path.segments.last()?;
+                if seg.ident.name.as_str() != "try_from" {
+                    return None;
+                }
+                let prev = path.segments.iter().rev().nth(1)?;
+                Some(prev.ident.name.as_str().to_string())
+            }
+            _ => None,
+        },
         _ => None,
     };
 
@@ -4410,8 +4751,10 @@ fn infer_any_userdata_param_type_from_body<'tcx>(
                     .find_map(|arg| infer_any_userdata_param_type_from_body(tcx, arg, param_name))
             })
         }
-        hir::ExprKind::Binary(_, lhs, rhs) => infer_any_userdata_param_type_from_body(tcx, lhs, param_name)
-            .or_else(|| infer_any_userdata_param_type_from_body(tcx, rhs, param_name)),
+        hir::ExprKind::Binary(_, lhs, rhs) => {
+            infer_any_userdata_param_type_from_body(tcx, lhs, param_name)
+                .or_else(|| infer_any_userdata_param_type_from_body(tcx, rhs, param_name))
+        }
         hir::ExprKind::Let(let_expr) => {
             infer_any_userdata_param_type_from_body(tcx, let_expr.init, param_name)
         }
@@ -4442,8 +4785,13 @@ fn infer_json_like_param_type_from_body<'tcx>(
     match &expr.kind {
         hir::ExprKind::Call(callee, args) => {
             if let Some(name) = called_path_name(callee)
-                && matches!(name.as_str(), "to_string" | "to_string_pretty" | "to_vec" | "to_vec_pretty")
-                && args.first().is_some_and(|arg| expr_refers_to_binding(arg, param_name))
+                && matches!(
+                    name.as_str(),
+                    "to_string" | "to_string_pretty" | "to_vec" | "to_vec_pretty"
+                )
+                && args
+                    .first()
+                    .is_some_and(|arg| expr_refers_to_binding(arg, param_name))
                 && path_contains_segment(callee, "serde_json")
             {
                 return Some(json_like_lua_type());
@@ -4472,24 +4820,44 @@ fn infer_json_like_param_type_from_body<'tcx>(
                 }
                 _ => None,
             })
-            .or_else(|| block.expr.and_then(|expr| infer_json_like_param_type_from_body(tcx, expr, param_name))),
-        hir::ExprKind::If(cond, then_expr, else_expr) => infer_json_like_param_type_from_body(tcx, cond, param_name)
-            .or_else(|| infer_json_like_param_type_from_body(tcx, then_expr, param_name))
-            .or_else(|| else_expr.and_then(|expr| infer_json_like_param_type_from_body(tcx, expr, param_name))),
-        hir::ExprKind::Match(scrutinee, arms, _) => infer_json_like_param_type_from_body(tcx, scrutinee, param_name)
-            .or_else(|| arms.iter().find_map(|arm| infer_json_like_param_type_from_body(tcx, arm.body, param_name))),
+            .or_else(|| {
+                block
+                    .expr
+                    .and_then(|expr| infer_json_like_param_type_from_body(tcx, expr, param_name))
+            }),
+        hir::ExprKind::If(cond, then_expr, else_expr) => {
+            infer_json_like_param_type_from_body(tcx, cond, param_name)
+                .or_else(|| infer_json_like_param_type_from_body(tcx, then_expr, param_name))
+                .or_else(|| {
+                    else_expr.and_then(|expr| {
+                        infer_json_like_param_type_from_body(tcx, expr, param_name)
+                    })
+                })
+        }
+        hir::ExprKind::Match(scrutinee, arms, _) => {
+            infer_json_like_param_type_from_body(tcx, scrutinee, param_name).or_else(|| {
+                arms.iter()
+                    .find_map(|arm| infer_json_like_param_type_from_body(tcx, arm.body, param_name))
+            })
+        }
         hir::ExprKind::Assign(lhs, rhs, _) | hir::ExprKind::AssignOp(_, lhs, rhs) => {
             infer_json_like_param_type_from_body(tcx, lhs, param_name)
                 .or_else(|| infer_json_like_param_type_from_body(tcx, rhs, param_name))
         }
-        hir::ExprKind::Binary(_, lhs, rhs) => infer_json_like_param_type_from_body(tcx, lhs, param_name)
-            .or_else(|| infer_json_like_param_type_from_body(tcx, rhs, param_name)),
-        hir::ExprKind::Let(let_expr) => infer_json_like_param_type_from_body(tcx, let_expr.init, param_name),
+        hir::ExprKind::Binary(_, lhs, rhs) => {
+            infer_json_like_param_type_from_body(tcx, lhs, param_name)
+                .or_else(|| infer_json_like_param_type_from_body(tcx, rhs, param_name))
+        }
+        hir::ExprKind::Let(let_expr) => {
+            infer_json_like_param_type_from_body(tcx, let_expr.init, param_name)
+        }
         hir::ExprKind::Struct(_, fields, tail) => fields
             .iter()
             .find_map(|field| infer_json_like_param_type_from_body(tcx, field.expr, param_name))
             .or_else(|| match tail {
-                hir::StructTailExpr::Base(base) => infer_json_like_param_type_from_body(tcx, base, param_name),
+                hir::StructTailExpr::Base(base) => {
+                    infer_json_like_param_type_from_body(tcx, base, param_name)
+                }
                 _ => None,
             }),
         hir::ExprKind::Array(items) | hir::ExprKind::Tup(items) => items
@@ -4499,7 +4867,9 @@ fn infer_json_like_param_type_from_body<'tcx>(
             let body = tcx.hir_body(closure.body);
             infer_json_like_param_type_from_body(tcx, body.value, param_name)
         }
-        hir::ExprKind::Ret(Some(inner)) => infer_json_like_param_type_from_body(tcx, inner, param_name),
+        hir::ExprKind::Ret(Some(inner)) => {
+            infer_json_like_param_type_from_body(tcx, inner, param_name)
+        }
         _ => None,
     }
 }
@@ -4510,7 +4880,9 @@ fn infer_table_param_type_from_body<'tcx>(
     param_name: &str,
 ) -> Option<LuaType> {
     let mut value_types = collect_table_param_value_types(tcx, expr, param_name);
-    value_types.extend(collect_nested_table_param_value_types(tcx, expr, param_name));
+    value_types.extend(collect_nested_table_param_value_types(
+        tcx, expr, param_name,
+    ));
     value_types = normalize_table_value_types(value_types);
     if value_types.is_empty() {
         None
@@ -4530,49 +4902,85 @@ fn infer_table_param_type_from_converter_calls<'tcx>(
     let expr = peel_try_expr(expr);
 
     match &expr.kind {
-        hir::ExprKind::Call(callee, args) => infer_table_converter_call_type(tcx, callee, args, param_name)
-            .or_else(|| infer_table_param_type_from_converter_calls(tcx, callee, param_name))
-            .or_else(|| args.iter().find_map(|arg| infer_table_param_type_from_converter_calls(tcx, arg, param_name))),
-        hir::ExprKind::MethodCall(_, receiver, args, _) => infer_table_param_type_from_converter_calls(tcx, receiver, param_name)
-            .or_else(|| args.iter().find_map(|arg| infer_table_param_type_from_converter_calls(tcx, arg, param_name))),
+        hir::ExprKind::Call(callee, args) => {
+            infer_table_converter_call_type(tcx, callee, args, param_name)
+                .or_else(|| infer_table_param_type_from_converter_calls(tcx, callee, param_name))
+                .or_else(|| {
+                    args.iter().find_map(|arg| {
+                        infer_table_param_type_from_converter_calls(tcx, arg, param_name)
+                    })
+                })
+        }
+        hir::ExprKind::MethodCall(_, receiver, args, _) => {
+            infer_table_param_type_from_converter_calls(tcx, receiver, param_name).or_else(|| {
+                args.iter().find_map(|arg| {
+                    infer_table_param_type_from_converter_calls(tcx, arg, param_name)
+                })
+            })
+        }
         hir::ExprKind::Block(block, _) => block
             .stmts
             .iter()
             .find_map(|stmt| match &stmt.kind {
-                hir::StmtKind::Let(local) => local
-                    .init
-                    .and_then(|init| infer_table_param_type_from_converter_calls(tcx, init, param_name)),
+                hir::StmtKind::Let(local) => local.init.and_then(|init| {
+                    infer_table_param_type_from_converter_calls(tcx, init, param_name)
+                }),
                 hir::StmtKind::Expr(expr) | hir::StmtKind::Semi(expr) => {
                     infer_table_param_type_from_converter_calls(tcx, expr, param_name)
                 }
                 _ => None,
             })
-            .or_else(|| block.expr.and_then(|expr| infer_table_param_type_from_converter_calls(tcx, expr, param_name))),
-        hir::ExprKind::Match(scrutinee, arms, _) => infer_table_param_type_from_converter_calls(tcx, scrutinee, param_name)
-            .or_else(|| arms.iter().find_map(|arm| infer_table_param_type_from_converter_calls(tcx, arm.body, param_name))),
-        hir::ExprKind::If(cond, then_expr, else_expr) => infer_table_param_type_from_converter_calls(tcx, cond, param_name)
-            .or_else(|| infer_table_param_type_from_converter_calls(tcx, then_expr, param_name))
-            .or_else(|| else_expr.and_then(|expr| infer_table_param_type_from_converter_calls(tcx, expr, param_name))),
-        hir::ExprKind::Assign(lhs, rhs, _) | hir::ExprKind::AssignOp(_, lhs, rhs) | hir::ExprKind::Binary(_, lhs, rhs) => {
+            .or_else(|| {
+                block.expr.and_then(|expr| {
+                    infer_table_param_type_from_converter_calls(tcx, expr, param_name)
+                })
+            }),
+        hir::ExprKind::Match(scrutinee, arms, _) => {
+            infer_table_param_type_from_converter_calls(tcx, scrutinee, param_name).or_else(|| {
+                arms.iter().find_map(|arm| {
+                    infer_table_param_type_from_converter_calls(tcx, arm.body, param_name)
+                })
+            })
+        }
+        hir::ExprKind::If(cond, then_expr, else_expr) => {
+            infer_table_param_type_from_converter_calls(tcx, cond, param_name)
+                .or_else(|| infer_table_param_type_from_converter_calls(tcx, then_expr, param_name))
+                .or_else(|| {
+                    else_expr.and_then(|expr| {
+                        infer_table_param_type_from_converter_calls(tcx, expr, param_name)
+                    })
+                })
+        }
+        hir::ExprKind::Assign(lhs, rhs, _)
+        | hir::ExprKind::AssignOp(_, lhs, rhs)
+        | hir::ExprKind::Binary(_, lhs, rhs) => {
             infer_table_param_type_from_converter_calls(tcx, lhs, param_name)
                 .or_else(|| infer_table_param_type_from_converter_calls(tcx, rhs, param_name))
         }
-        hir::ExprKind::Let(let_expr) => infer_table_param_type_from_converter_calls(tcx, let_expr.init, param_name),
+        hir::ExprKind::Let(let_expr) => {
+            infer_table_param_type_from_converter_calls(tcx, let_expr.init, param_name)
+        }
         hir::ExprKind::Array(items) | hir::ExprKind::Tup(items) => items
             .iter()
             .find_map(|item| infer_table_param_type_from_converter_calls(tcx, item, param_name)),
         hir::ExprKind::Struct(_, fields, tail) => fields
             .iter()
-            .find_map(|field| infer_table_param_type_from_converter_calls(tcx, field.expr, param_name))
+            .find_map(|field| {
+                infer_table_param_type_from_converter_calls(tcx, field.expr, param_name)
+            })
             .or_else(|| match tail {
-                hir::StructTailExpr::Base(base) => infer_table_param_type_from_converter_calls(tcx, base, param_name),
+                hir::StructTailExpr::Base(base) => {
+                    infer_table_param_type_from_converter_calls(tcx, base, param_name)
+                }
                 _ => None,
             }),
         hir::ExprKind::Closure(closure) => {
             let body = tcx.hir_body(closure.body);
             infer_table_param_type_from_converter_calls(tcx, body.value, param_name)
         }
-        hir::ExprKind::Ret(Some(inner)) => infer_table_param_type_from_converter_calls(tcx, inner, param_name),
+        hir::ExprKind::Ret(Some(inner)) => {
+            infer_table_param_type_from_converter_calls(tcx, inner, param_name)
+        }
         _ => None,
     }
 }
@@ -4605,7 +5013,9 @@ fn infer_table_converter_call_type<'tcx>(
 
     let snippet = snippet?;
 
-    if !snippet.contains("pairs::<Value, Value>()") && !snippet.contains("pairs::<mlua::Value, mlua::Value>()") {
+    if !snippet.contains("pairs::<Value, Value>()")
+        && !snippet.contains("pairs::<mlua::Value, mlua::Value>()")
+    {
         return None;
     }
 
@@ -4647,9 +5057,7 @@ fn normalize_table_value_types(mut value_types: Vec<LuaType>) -> Vec<LuaType> {
         value_types.retain(|ty| !is_generic_userdata_ref_type(ty));
     }
 
-    let has_specific = value_types
-        .iter()
-        .any(|ty| !matches!(ty, LuaType::Table));
+    let has_specific = value_types.iter().any(|ty| !matches!(ty, LuaType::Table));
 
     if has_specific {
         value_types.retain(|ty| !matches!(ty, LuaType::Table));
@@ -4691,8 +5099,14 @@ fn normalize_inferred_lua_type(ty: LuaType) -> LuaType {
             LuaType::Variadic(Box::new(normalize_inferred_lua_type(*inner)))
         }
         LuaType::FunctionSig { params, returns } => LuaType::FunctionSig {
-            params: params.into_iter().map(normalize_inferred_lua_type).collect(),
-            returns: returns.into_iter().map(normalize_inferred_lua_type).collect(),
+            params: params
+                .into_iter()
+                .map(normalize_inferred_lua_type)
+                .collect(),
+            returns: returns
+                .into_iter()
+                .map(normalize_inferred_lua_type)
+                .collect(),
         },
         other => other,
     }
@@ -4722,7 +5136,10 @@ fn normalize_userdata_ref_alias_type(ty: &mut LuaType) {
             for suffix in ["RefMut", "Ref"] {
                 if let Some(base) = name.strip_suffix(suffix)
                     && !base.is_empty()
-                    && base.chars().next().is_some_and(|ch| ch.is_ascii_uppercase())
+                    && base
+                        .chars()
+                        .next()
+                        .is_some_and(|ch| ch.is_ascii_uppercase())
                 {
                     *name = base.to_string();
                     break;
@@ -4768,7 +5185,11 @@ fn collect_nested_table_param_value_types<'tcx>(
                 if let hir::StmtKind::Let(local) = &stmt.kind
                     && let Some(init) = local.init
                     && let Some(_key) = raw_get_table_binding_key(init, param_name)
-                    && let Some(ty) = infer_table_binding_usage_type(tcx, block.expr.unwrap_or(expr), &pat_to_name(local.pat))
+                    && let Some(ty) = infer_table_binding_usage_type(
+                        tcx,
+                        block.expr.unwrap_or(expr),
+                        &pat_to_name(local.pat),
+                    )
                 {
                     tys.push(ty);
                 }
@@ -4778,32 +5199,44 @@ fn collect_nested_table_param_value_types<'tcx>(
                 match &stmt.kind {
                     hir::StmtKind::Let(local) => {
                         if let Some(init) = local.init {
-                            tys.extend(collect_nested_table_param_value_types(tcx, init, param_name));
+                            tys.extend(collect_nested_table_param_value_types(
+                                tcx, init, param_name,
+                            ));
                         }
                     }
                     hir::StmtKind::Expr(expr) | hir::StmtKind::Semi(expr) => {
-                        tys.extend(collect_nested_table_param_value_types(tcx, expr, param_name));
+                        tys.extend(collect_nested_table_param_value_types(
+                            tcx, expr, param_name,
+                        ));
                     }
                     _ => {}
                 }
             }
             if let Some(tail) = block.expr {
-                tys.extend(collect_nested_table_param_value_types(tcx, tail, param_name));
+                tys.extend(collect_nested_table_param_value_types(
+                    tcx, tail, param_name,
+                ));
             }
             tys
         }
         hir::ExprKind::Match(scrutinee, arms, _) => {
             let mut tys = collect_nested_table_param_value_types(tcx, scrutinee, param_name);
             for arm in *arms {
-                tys.extend(collect_nested_table_param_value_types(tcx, arm.body, param_name));
+                tys.extend(collect_nested_table_param_value_types(
+                    tcx, arm.body, param_name,
+                ));
             }
             tys
         }
         hir::ExprKind::If(cond, then_expr, else_expr) => {
             let mut tys = collect_nested_table_param_value_types(tcx, cond, param_name);
-            tys.extend(collect_nested_table_param_value_types(tcx, then_expr, param_name));
+            tys.extend(collect_nested_table_param_value_types(
+                tcx, then_expr, param_name,
+            ));
             if let Some(else_expr) = else_expr {
-                tys.extend(collect_nested_table_param_value_types(tcx, else_expr, param_name));
+                tys.extend(collect_nested_table_param_value_types(
+                    tcx, else_expr, param_name,
+                ));
             }
             tys
         }
@@ -4831,7 +5264,9 @@ fn collect_nested_table_param_value_types<'tcx>(
             tys.extend(collect_nested_table_param_value_types(tcx, rhs, param_name));
             tys
         }
-        hir::ExprKind::Let(let_expr) => collect_nested_table_param_value_types(tcx, let_expr.init, param_name),
+        hir::ExprKind::Let(let_expr) => {
+            collect_nested_table_param_value_types(tcx, let_expr.init, param_name)
+        }
         hir::ExprKind::Array(items) | hir::ExprKind::Tup(items) => items
             .iter()
             .flat_map(|item| collect_nested_table_param_value_types(tcx, item, param_name))
@@ -4840,7 +5275,9 @@ fn collect_nested_table_param_value_types<'tcx>(
             .iter()
             .flat_map(|field| collect_nested_table_param_value_types(tcx, field.expr, param_name))
             .chain(match tail {
-                hir::StructTailExpr::Base(base) => collect_nested_table_param_value_types(tcx, base, param_name),
+                hir::StructTailExpr::Base(base) => {
+                    collect_nested_table_param_value_types(tcx, base, param_name)
+                }
                 _ => Vec::new(),
             })
             .collect(),
@@ -4848,7 +5285,9 @@ fn collect_nested_table_param_value_types<'tcx>(
             let body = tcx.hir_body(closure.body);
             collect_nested_table_param_value_types(tcx, body.value, param_name)
         }
-        hir::ExprKind::Ret(Some(inner)) => collect_nested_table_param_value_types(tcx, inner, param_name),
+        hir::ExprKind::Ret(Some(inner)) => {
+            collect_nested_table_param_value_types(tcx, inner, param_name)
+        }
         _ => Vec::new(),
     }
 }
@@ -4910,8 +5349,12 @@ fn infer_table_binding_usage_type<'tcx>(
 
             infer_table_binding_usage_type(tcx, receiver, binding_name)
         }
-        hir::ExprKind::Call(callee, args) => infer_table_binding_usage_type(tcx, callee, binding_name)
-            .or_else(|| args.iter().find_map(|arg| infer_table_binding_usage_type(tcx, arg, binding_name))),
+        hir::ExprKind::Call(callee, args) => {
+            infer_table_binding_usage_type(tcx, callee, binding_name).or_else(|| {
+                args.iter()
+                    .find_map(|arg| infer_table_binding_usage_type(tcx, arg, binding_name))
+            })
+        }
         hir::ExprKind::Block(block, _) => block
             .stmts
             .iter()
@@ -4924,19 +5367,36 @@ fn infer_table_binding_usage_type<'tcx>(
                 }
                 _ => None,
             })
-            .or_else(|| block.expr.and_then(|expr| infer_table_binding_usage_type(tcx, expr, binding_name))),
-        hir::ExprKind::Match(scrutinee, arms, _) => infer_table_binding_usage_type(tcx, scrutinee, binding_name)
-            .or_else(|| arms.iter().find_map(|arm| infer_table_binding_usage_type(tcx, arm.body, binding_name))),
-        hir::ExprKind::If(cond, then_expr, else_expr) => infer_table_binding_usage_type(tcx, cond, binding_name)
-            .or_else(|| infer_table_binding_usage_type(tcx, then_expr, binding_name))
-            .or_else(|| else_expr.and_then(|expr| infer_table_binding_usage_type(tcx, expr, binding_name))),
+            .or_else(|| {
+                block
+                    .expr
+                    .and_then(|expr| infer_table_binding_usage_type(tcx, expr, binding_name))
+            }),
+        hir::ExprKind::Match(scrutinee, arms, _) => {
+            infer_table_binding_usage_type(tcx, scrutinee, binding_name).or_else(|| {
+                arms.iter()
+                    .find_map(|arm| infer_table_binding_usage_type(tcx, arm.body, binding_name))
+            })
+        }
+        hir::ExprKind::If(cond, then_expr, else_expr) => {
+            infer_table_binding_usage_type(tcx, cond, binding_name)
+                .or_else(|| infer_table_binding_usage_type(tcx, then_expr, binding_name))
+                .or_else(|| {
+                    else_expr
+                        .and_then(|expr| infer_table_binding_usage_type(tcx, expr, binding_name))
+                })
+        }
         hir::ExprKind::Assign(lhs, rhs, _) | hir::ExprKind::AssignOp(_, lhs, rhs) => {
             infer_table_binding_usage_type(tcx, lhs, binding_name)
                 .or_else(|| infer_table_binding_usage_type(tcx, rhs, binding_name))
         }
-        hir::ExprKind::Binary(_, lhs, rhs) => infer_table_binding_usage_type(tcx, lhs, binding_name)
-            .or_else(|| infer_table_binding_usage_type(tcx, rhs, binding_name)),
-        hir::ExprKind::Let(let_expr) => infer_table_binding_usage_type(tcx, let_expr.init, binding_name),
+        hir::ExprKind::Binary(_, lhs, rhs) => {
+            infer_table_binding_usage_type(tcx, lhs, binding_name)
+                .or_else(|| infer_table_binding_usage_type(tcx, rhs, binding_name))
+        }
+        hir::ExprKind::Let(let_expr) => {
+            infer_table_binding_usage_type(tcx, let_expr.init, binding_name)
+        }
         hir::ExprKind::Array(items) | hir::ExprKind::Tup(items) => items
             .iter()
             .find_map(|item| infer_table_binding_usage_type(tcx, item, binding_name)),
@@ -4944,7 +5404,9 @@ fn infer_table_binding_usage_type<'tcx>(
             .iter()
             .find_map(|field| infer_table_binding_usage_type(tcx, field.expr, binding_name))
             .or_else(|| match tail {
-                hir::StructTailExpr::Base(base) => infer_table_binding_usage_type(tcx, base, binding_name),
+                hir::StructTailExpr::Base(base) => {
+                    infer_table_binding_usage_type(tcx, base, binding_name)
+                }
                 _ => None,
             }),
         hir::ExprKind::Closure(closure) => {
@@ -4972,12 +5434,11 @@ fn collect_table_param_value_types<'tcx>(
                 && !args.is_empty()
                 && extract_string_literal(&args[0]).is_some()
             {
-                let lua_ty = method_generic_lua_type(tcx, expr, segment)
-                    .unwrap_or_else(|| {
-                        let typeck = tcx.typeck(expr.hir_id.owner.def_id);
-                        let ty = unwrap_result_ty(tcx, typeck.expr_ty(expr));
-                        map_ty_to_lua(tcx, ty)
-                    });
+                let lua_ty = method_generic_lua_type(tcx, expr, segment).unwrap_or_else(|| {
+                    let typeck = tcx.typeck(expr.hir_id.owner.def_id);
+                    let ty = unwrap_result_ty(tcx, typeck.expr_ty(expr));
+                    map_ty_to_lua(tcx, ty)
+                });
                 if is_informative(&lua_ty) {
                     tys.push(lua_ty);
                 }
@@ -5055,12 +5516,16 @@ fn collect_table_param_value_types<'tcx>(
             tys.extend(collect_table_param_value_types(tcx, rhs, param_name));
             tys
         }
-        hir::ExprKind::Let(let_expr) => collect_table_param_value_types(tcx, let_expr.init, param_name),
+        hir::ExprKind::Let(let_expr) => {
+            collect_table_param_value_types(tcx, let_expr.init, param_name)
+        }
         hir::ExprKind::Struct(_, fields, tail) => fields
             .iter()
             .flat_map(|field| collect_table_param_value_types(tcx, field.expr, param_name))
             .chain(match tail {
-                hir::StructTailExpr::Base(base) => collect_table_param_value_types(tcx, base, param_name),
+                hir::StructTailExpr::Base(base) => {
+                    collect_table_param_value_types(tcx, base, param_name)
+                }
                 _ => Vec::new(),
             })
             .collect(),
@@ -5095,7 +5560,9 @@ fn infer_table_param_let_binding_type(
         return None;
     }
 
-    local.ty.and_then(|ty| lua_type_from_hir_ty_with_snippet(tcx, ty))
+    local
+        .ty
+        .and_then(|ty| lua_type_from_hir_ty_with_snippet(tcx, ty))
 }
 
 fn json_like_lua_type() -> LuaType {
@@ -5248,7 +5715,7 @@ fn infer_value_converter_types_from_snippet(snippet: &str) -> Vec<LuaType> {
     ];
     for marker in markers {
         for name in extract_all_generic_type_names(snippet, marker) {
-            tys.push(lua_type_from_extracted_name(name));
+            tys.push(lua_type_from_extracted_name(&name));
         }
     }
 
@@ -5297,7 +5764,7 @@ fn extract_type_id_of_lua_type(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> Option<
     let expr = peel_try_expr(expr);
     let hir::ExprKind::Call(callee, _) = &expr.kind else {
         return snippet_generic_type_name(&expr_snippet(tcx, expr), "TypeId::of::<")
-            .map(|name| LuaType::Class(name));
+            .map(LuaType::Class);
     };
     let args = match &callee.kind {
         hir::ExprKind::Path(hir::QPath::TypeRelative(_, seg))
@@ -5317,18 +5784,18 @@ fn extract_type_id_of_lua_type(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> Option<
 
     let hir::GenericArg::Type(ty) = args.args.first()? else {
         return snippet_generic_type_name(&expr_snippet(tcx, expr), "TypeId::of::<")
-            .map(|name| LuaType::Class(name));
+            .map(LuaType::Class);
     };
 
     let hir::TyKind::Path(qpath) = &ty.kind else {
         return snippet_generic_type_name(&expr_snippet(tcx, expr), "TypeId::of::<")
-            .map(|name| LuaType::Class(name));
+            .map(LuaType::Class);
     };
 
     Some(LuaType::Class(extract_type_name_from_qpath(qpath)?))
 }
 
-fn lua_type_from_extracted_name(name: String) -> LuaType {
+fn lua_type_from_extracted_name(name: &str) -> LuaType {
     let name = name.trim();
     let qualified_name = last_path_segment(name).trim();
 
@@ -5336,14 +5803,14 @@ fn lua_type_from_extracted_name(name: String) -> LuaType {
         .strip_prefix("Option<")
         .and_then(|inner| inner.strip_suffix('>'))
     {
-        return LuaType::Optional(Box::new(lua_type_from_extracted_name(inner.trim().to_string())));
+        return LuaType::Optional(Box::new(lua_type_from_extracted_name(inner.trim())));
     }
 
     if let Some(inner) = qualified_name
         .strip_prefix("Vec<")
         .and_then(|inner| inner.strip_suffix('>'))
     {
-        return LuaType::Array(Box::new(lua_type_from_extracted_name(inner.trim().to_string())));
+        return LuaType::Array(Box::new(lua_type_from_extracted_name(inner.trim())));
     }
 
     for wrapper in ["UserDataRef<", "UserDataRefMut<"] {
@@ -5351,7 +5818,7 @@ fn lua_type_from_extracted_name(name: String) -> LuaType {
             .strip_prefix(wrapper)
             .and_then(|inner| inner.strip_suffix('>'))
         {
-            return lua_type_from_extracted_name(inner.trim().to_string());
+            return lua_type_from_extracted_name(inner.trim());
         }
     }
 
@@ -5551,7 +6018,10 @@ fn method_trace_summary(method: &LuaMethod) -> String {
 }
 
 fn field_trace_summary(field: &LuaField) -> String {
-    format!("{} ty={:?} writable={}", field.name, field.ty, field.writable)
+    format!(
+        "{} ty={:?} writable={}",
+        field.name, field.ty, field.writable
+    )
 }
 
 fn trace_class_snapshot(label: &str, class_name: &str, fields: &[LuaField], methods: &[LuaMethod]) {
@@ -5747,10 +6217,10 @@ fn find_projection<'tcx>(
     assoc_name: &str,
 ) -> Option<ty::Ty<'tcx>> {
     for pred in predicates.iter() {
-        if let ty::ExistentialPredicate::Projection(proj) = pred.skip_binder() {
-            if tcx.item_name(proj.def_id).as_str() == assoc_name {
-                return proj.term.as_type();
-            }
+        if let ty::ExistentialPredicate::Projection(proj) = pred.skip_binder()
+            && tcx.item_name(proj.def_id).as_str() == assoc_name
+        {
+            return proj.term.as_type();
         }
     }
     None
@@ -5762,79 +6232,76 @@ fn map_dyn_trait<'tcx>(
     predicates: &'tcx ty::List<ty::PolyExistentialPredicate<'tcx>>,
 ) -> LuaType {
     for pred in predicates.iter() {
-        match pred.skip_binder() {
-            ty::ExistentialPredicate::Trait(trait_ref) => {
-                let trait_path = tcx.def_path_str(trait_ref.def_id);
+        if let ty::ExistentialPredicate::Trait(trait_ref) = pred.skip_binder() {
+            let trait_path = tcx.def_path_str(trait_ref.def_id);
 
-                // dyn Fn(A, B) -> C → fun(p1: A, p2: B): C
-                if is_fn_trait(&trait_path) {
-                    // Fn trait args are encoded as the trait's generic args (tuple of params)
-                    let params: Vec<LuaType> = trait_ref
-                        .args
-                        .iter()
-                        .filter_map(|arg| arg.as_type())
-                        // The first arg is the tuple of parameters
-                        .next()
-                        .map(|tuple_ty| match tuple_ty.kind() {
-                            ty::TyKind::Tuple(fields) => {
-                                fields.iter().map(|t| map_ty_to_lua(tcx, t)).collect()
-                            }
-                            _ => vec![map_ty_to_lua(tcx, tuple_ty)],
-                        })
-                        .unwrap_or_default();
+            // dyn Fn(A, B) -> C → fun(p1: A, p2: B): C
+            if is_fn_trait(&trait_path) {
+                // Fn trait args are encoded as the trait's generic args (tuple of params)
+                let params: Vec<LuaType> = trait_ref
+                    .args
+                    .iter()
+                    .filter_map(|arg| arg.as_type())
+                    // The first arg is the tuple of parameters
+                    .next()
+                    .map(|tuple_ty| match tuple_ty.kind() {
+                        ty::TyKind::Tuple(fields) => {
+                            fields.iter().map(|t| map_ty_to_lua(tcx, t)).collect()
+                        }
+                        _ => vec![map_ty_to_lua(tcx, tuple_ty)],
+                    })
+                    .unwrap_or_default();
 
-                    // Return type is in the Output projection
-                    let returns = find_projection(tcx, predicates, "Output")
-                        .map(|ret_ty| {
-                            let lua_ty = map_ty_to_lua(tcx, ret_ty);
-                            if lua_ty == LuaType::Nil {
-                                vec![]
-                            } else {
-                                vec![lua_ty]
-                            }
-                        })
-                        .unwrap_or_default();
+                // Return type is in the Output projection
+                let returns = find_projection(tcx, predicates, "Output")
+                    .map(|ret_ty| {
+                        let lua_ty = map_ty_to_lua(tcx, ret_ty);
+                        if lua_ty == LuaType::Nil {
+                            vec![]
+                        } else {
+                            vec![lua_ty]
+                        }
+                    })
+                    .unwrap_or_default();
 
-                    if params.is_empty() && returns.is_empty() {
-                        return LuaType::Function;
-                    }
-                    return LuaType::FunctionSig { params, returns };
+                if params.is_empty() && returns.is_empty() {
+                    return LuaType::Function;
                 }
-
-                if is_string_trait(&trait_path) {
-                    return LuaType::String;
-                }
-
-                // dyn AsRef<T> / dyn Borrow<T> → map T
-                if is_asref_trait(&trait_path) {
-                    if let Some(target) = trait_ref.args.iter().filter_map(|a| a.as_type()).next() {
-                        return map_ty_to_lua(tcx, target);
-                    }
-                }
-
-                // dyn Into<T> → map T
-                if is_into_trait(&trait_path) {
-                    if let Some(target) = trait_ref.args.iter().filter_map(|a| a.as_type()).next() {
-                        return map_ty_to_lua(tcx, target);
-                    }
-                }
-
-                // dyn Deref<Target = T> → map T
-                if is_deref_trait(&trait_path) {
-                    if let Some(target_ty) = find_projection(tcx, predicates, "Target") {
-                        return map_ty_to_lua(tcx, target_ty);
-                    }
-                }
-
-                // dyn Iterator<Item = T> / dyn IntoIterator<Item = T> → T[]
-                if is_iterator_trait(&trait_path) {
-                    if let Some(item_ty) = find_projection(tcx, predicates, "Item") {
-                        return LuaType::Array(Box::new(map_ty_to_lua(tcx, item_ty)));
-                    }
-                    return LuaType::Array(Box::new(LuaType::Any));
-                }
+                return LuaType::FunctionSig { params, returns };
             }
-            _ => {}
+
+            if is_string_trait(&trait_path) {
+                return LuaType::String;
+            }
+
+            // dyn AsRef<T> / dyn Borrow<T> → map T
+            if is_asref_trait(&trait_path)
+                && let Some(target) = trait_ref.args.iter().find_map(|a| a.as_type())
+            {
+                return map_ty_to_lua(tcx, target);
+            }
+
+            // dyn Into<T> → map T
+            if is_into_trait(&trait_path)
+                && let Some(target) = trait_ref.args.iter().find_map(|a| a.as_type())
+            {
+                return map_ty_to_lua(tcx, target);
+            }
+
+            // dyn Deref<Target = T> → map T
+            if is_deref_trait(&trait_path)
+                && let Some(target_ty) = find_projection(tcx, predicates, "Target")
+            {
+                return map_ty_to_lua(tcx, target_ty);
+            }
+
+            // dyn Iterator<Item = T> / dyn IntoIterator<Item = T> → T[]
+            if is_iterator_trait(&trait_path) {
+                if let Some(item_ty) = find_projection(tcx, predicates, "Item") {
+                    return LuaType::Array(Box::new(map_ty_to_lua(tcx, item_ty)));
+                }
+                return LuaType::Array(Box::new(LuaType::Any));
+            }
         }
     }
     LuaType::Any
@@ -5903,12 +6370,11 @@ fn map_ty_to_lua<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> LuaType {
             let path = qualified_def_path_str(tcx, adt_def.did());
 
             // Vec<u8> / VecDeque<u8> etc. → string (byte buffer)
-            if is_byte_container(&path) {
-                if let Some(inner) = args.types().next() {
-                    if is_u8(&inner) {
-                        return LuaType::String;
-                    }
-                }
+            if is_byte_container(&path)
+                && let Some(inner) = args.types().next()
+                && is_u8(&inner)
+            {
+                return LuaType::String;
             }
 
             let type_args: Vec<LuaType> = args.types().map(|t| map_ty_to_lua(tcx, t)).collect();
@@ -5922,12 +6388,24 @@ fn map_ty_to_lua<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> LuaType {
                 mapped
             } else {
                 let path = qualified_def_path_str(tcx, alias.def_id);
-                let type_args: Vec<LuaType> = alias.args.types().map(|t| map_ty_to_lua(tcx, t)).collect();
+                let type_args: Vec<LuaType> =
+                    alias.args.types().map(|t| map_ty_to_lua(tcx, t)).collect();
                 let fallback = map_rust_type(&path, &type_args);
                 if is_informative(&fallback) {
                     fallback
                 } else {
-                    LuaType::Class(path.rsplit("::").next().unwrap_or_default().to_string())
+                    let name = path.rsplit("::").next().unwrap_or_default();
+                    let has_informative_args = type_args.iter().any(|a| !matches!(a, LuaType::Any));
+                    if has_informative_args {
+                        let args = type_args
+                            .iter()
+                            .map(|a| a.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        LuaType::Class(format!("{name}<{args}>"))
+                    } else {
+                        LuaType::Class(name.to_string())
+                    }
                 }
             }
         }
@@ -5970,10 +6448,10 @@ fn map_return_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> Vec<LuaReturn> {
 fn unwrap_result_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> ty::Ty<'tcx> {
     if let ty::TyKind::Adt(adt_def, args) = ty.kind() {
         let path = tcx.def_path_str(adt_def.did());
-        if path == "std::result::Result" || path == "core::result::Result" {
-            if let Some(inner) = args.types().next() {
-                return inner;
-            }
+        if (path == "std::result::Result" || path == "core::result::Result")
+            && let Some(inner) = args.types().next()
+        {
+            return inner;
         }
     }
     ty
@@ -6005,15 +6483,15 @@ fn unwrap_coroutine_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> ty::Ty<'tcx
                 fallback = Some(inner_ty);
             }
 
-            if let Some(err_ty) = result_args.types().nth(1) {
-                if let ty::TyKind::Adt(err_def, _) = err_ty.kind() {
-                    let err_path = tcx.def_path_str(err_def.did());
-                    if (err_path.contains("mlua") && err_path.ends_with("Error"))
-                        || err_path.ends_with("mlua::Error")
-                        || err_path == "mlua::Error"
-                    {
-                        return inner_ty;
-                    }
+            if let Some(err_ty) = result_args.types().nth(1)
+                && let ty::TyKind::Adt(err_def, _) = err_ty.kind()
+            {
+                let err_path = tcx.def_path_str(err_def.did());
+                if (err_path.contains("mlua") && err_path.ends_with("Error"))
+                    || err_path.ends_with("mlua::Error")
+                    || err_path == "mlua::Error"
+                {
+                    return inner_ty;
                 }
             }
         }
@@ -6071,7 +6549,9 @@ fn try_lua_value_constructor<'tcx>(
         // LuaValue::Nil (path expression, no call)
         hir::ExprKind::Path(qpath) => {
             let variant = match qpath {
-                hir::QPath::Resolved(_, path) => path.segments.last().map(|seg| seg.ident.name.as_str()),
+                hir::QPath::Resolved(_, path) => {
+                    path.segments.last().map(|seg| seg.ident.name.as_str())
+                }
                 hir::QPath::TypeRelative(_, seg) => Some(seg.ident.name.as_str()),
             }?;
 
@@ -6089,15 +6569,15 @@ fn try_lua_value_constructor<'tcx>(
             if let hir::ExprKind::Path(hir::QPath::TypeRelative(_, seg)) = &callee.kind {
                 return lua_value_variant_to_type(seg.ident.name.as_str());
             }
-            if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = &callee.kind {
-                if let Some(seg) = path.segments.last() {
-                    // Verify the return type is a Value type
-                    let ty = typeck.expr_ty(expr);
-                    if let ty::TyKind::Adt(adt_def, _) = ty.kind() {
-                        let path_str = tcx.def_path_str(adt_def.did());
-                        if path_str.contains("Value") && !path_str.contains("MultiValue") {
-                            return lua_value_variant_to_type(seg.ident.name.as_str());
-                        }
+            if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = &callee.kind
+                && let Some(seg) = path.segments.last()
+            {
+                // Verify the return type is a Value type
+                let ty = typeck.expr_ty(expr);
+                if let ty::TyKind::Adt(adt_def, _) = ty.kind() {
+                    let path_str = tcx.def_path_str(adt_def.did());
+                    if path_str.contains("Value") && !path_str.contains("MultiValue") {
+                        return lua_value_variant_to_type(seg.ident.name.as_str());
                     }
                 }
             }
@@ -6126,7 +6606,13 @@ fn extract_type_name_from_qpath(qpath: &hir::QPath<'_>) -> Option<String> {
             if last_starts_like_type || path.segments.len() == 1 {
                 Some(last)
             } else if path.segments.len() >= 2 {
-                Some(path.segments[path.segments.len() - 2].ident.name.as_str().to_string())
+                Some(
+                    path.segments[path.segments.len() - 2]
+                        .ident
+                        .name
+                        .as_str()
+                        .to_string(),
+                )
             } else {
                 None
             }
@@ -6158,6 +6644,33 @@ fn extract_return_type_from_cast<'tcx>(
     extract_type_from_closure_expr(tcx, cast_expr)
 }
 
+fn extract_type_name_from_value_path_expr<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+) -> Option<String> {
+    let hir::ExprKind::Path(qpath) = &expr.kind else {
+        return None;
+    };
+
+    match qpath {
+        hir::QPath::TypeRelative(_, _) => extract_type_name_from_qpath(qpath),
+        hir::QPath::Resolved(_, _) => {
+            let res = tcx
+                .typeck(expr.hir_id.owner.def_id)
+                .qpath_res(qpath, expr.hir_id);
+            matches!(
+                res,
+                rustc_hir::def::Res::Def(
+                    rustc_hir::def::DefKind::Ctor(rustc_hir::def::CtorOf::Struct, _),
+                    _
+                )
+            )
+            .then(|| extract_type_name_from_qpath(qpath))
+            .flatten()
+        }
+    }
+}
+
 /// Try to extract a class name from a closure expression by looking at what it calls.
 /// Recursively searches through closures, blocks, method chains, and call expressions.
 fn extract_type_from_closure_expr<'tcx>(
@@ -6174,32 +6687,32 @@ fn extract_type_from_closure_expr<'tcx>(
         | hir::ExprKind::Field(inner, _)
         | hir::ExprKind::Become(inner)
         | hir::ExprKind::Yield(inner, _)
-        | hir::ExprKind::UnsafeBinderCast(_, inner, _) => extract_type_from_closure_expr(tcx, inner),
+        | hir::ExprKind::UnsafeBinderCast(_, inner, _) => {
+            extract_type_from_closure_expr(tcx, inner)
+        }
         hir::ExprKind::Closure(closure) => {
             let body = tcx.hir_body(closure.body);
             extract_type_from_closure_expr(tcx, body.value)
         }
         hir::ExprKind::Block(block, _) => {
-            if let Some(tail) = block.expr {
-                if let Some(name) = extract_type_from_closure_expr(tcx, tail) {
-                    return Some(name);
-                }
+            if let Some(tail) = block.expr
+                && let Some(name) = extract_type_from_closure_expr(tcx, tail)
+            {
+                return Some(name);
             }
             // Check statements too
             for stmt in block.stmts {
-                if let hir::StmtKind::Semi(e) | hir::StmtKind::Expr(e) = &stmt.kind {
-                    if let Some(name) = extract_type_from_closure_expr(tcx, e) {
-                        return Some(name);
-                    }
+                if let hir::StmtKind::Semi(e) | hir::StmtKind::Expr(e) = &stmt.kind
+                    && let Some(name) = extract_type_from_closure_expr(tcx, e)
+                {
+                    return Some(name);
                 }
             }
             None
         }
         hir::ExprKind::Call(callee, args) => {
-            if let hir::ExprKind::Path(qpath) = &callee.kind {
-                if let Some(name) = extract_type_name_from_qpath(qpath) {
-                    return Some(name);
-                }
+            if let Some(name) = extract_type_name_from_value_path_expr(tcx, callee) {
+                return Some(name);
             }
             // Check args (e.g. the closure in .map(|x| TypeName::make(x)))
             for arg in *args {
@@ -6246,7 +6759,7 @@ fn extract_type_from_closure_expr<'tcx>(
             }
         }
         // Bare function reference like Filter::make — extract the type from the path
-        hir::ExprKind::Path(qpath) => extract_type_name_from_qpath(qpath),
+        hir::ExprKind::Path(_) => extract_type_name_from_value_path_expr(tcx, expr),
         _ => None,
     }
 }
@@ -6364,17 +6877,423 @@ fn infer_multi_returns_from_body<'tcx>(
     infer_concrete_type_from_body(tcx, expr).map(|ty| vec![ty.into()])
 }
 
+fn infer_forwarded_multivalue_returns<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+    segment: &hir::PathSegment<'tcx>,
+    args: &'tcx [hir::Expr<'tcx>],
+) -> Option<Vec<LuaReturn>> {
+    let runtime_name = args
+        .first()
+        .and_then(|arg| extract_runtime_method_name(tcx, arg));
+    let state = args
+        .get(1)
+        .and_then(|arg| infer_forwarded_userdata_state_type(tcx, arg));
+
+    if !matches!(
+        segment.ident.name.as_str(),
+        "call_function" | "call_async_function"
+    ) {
+        return None;
+    }
+
+    if !matches!(infer_expr_lua_type(tcx, expr), LuaType::Variadic(_)) {
+        return None;
+    }
+
+    let method_name = runtime_name?;
+    if method_name != "__pairs" {
+        return None;
+    }
+
+    let state = infer_pairs_state_type(tcx, expr, &state?);
+    Some(infer_pairs_forward_returns(&state))
+}
+
+fn extract_runtime_method_name(tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> Option<String> {
+    let expr = peel_try_expr(expr);
+
+    if let Some(name) = extract_string_literal(expr) {
+        return Some(name);
+    }
+
+    let hir::ExprKind::MethodCall(segment, receiver, _, _) = &expr.kind else {
+        return None;
+    };
+    (segment.ident.name.as_str() == "name")
+        .then(|| extract_meta_method_name(tcx, receiver))
+        .flatten()
+}
+
+fn infer_forwarded_userdata_state_type<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+) -> Option<LuaType> {
+    let expr = peel_try_expr(expr);
+
+    match &expr.kind {
+        hir::ExprKind::Call(callee, args) => infer_informative_expr_type(tcx, expr)
+            .or_else(|| {
+                args.iter()
+                    .find_map(|arg| infer_forwarded_userdata_state_type(tcx, arg))
+            })
+            .or_else(|| infer_forwarded_userdata_state_type(tcx, callee))
+            .or_else(|| resolve_any_user_data_class(tcx, expr)),
+        hir::ExprKind::MethodCall(segment, receiver, _, _)
+            if is_passthrough_method(segment.ident.name.as_str()) =>
+        {
+            infer_forwarded_userdata_state_type(tcx, receiver)
+        }
+        hir::ExprKind::Field(base, ident) => {
+            infer_userdata_field_init_type(tcx, base, ident.name.as_str())
+                .or_else(|| infer_informative_expr_type(tcx, expr))
+                .or_else(|| resolve_any_user_data_class(tcx, expr))
+        }
+        _ => infer_informative_expr_type(tcx, expr)
+            .or_else(|| resolve_any_user_data_class(tcx, expr)),
+    }
+}
+
+fn infer_informative_expr_type<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+) -> Option<LuaType> {
+    let typeck = tcx.typeck(expr.hir_id.owner.def_id);
+    infer_from_expr(tcx, typeck, expr).filter(is_informative)
+}
+
+fn infer_userdata_field_init_type<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    base: &'tcx hir::Expr<'tcx>,
+    field_name: &str,
+) -> Option<LuaType> {
+    let class_name = expr_userdata_container_name(tcx, base)
+        .or_else(|| enclosing_impl_self_type_name(tcx, base.hir_id.owner.def_id))?;
+
+    let mut best = None;
+    for item_id in tcx.hir_crate_items(()).free_items() {
+        let item = tcx.hir_item(item_id);
+        if let Some(candidate) =
+            infer_struct_field_init_type_from_item(tcx, item, &class_name, field_name)
+        {
+            best = merge_body_inference(best, candidate);
+        }
+    }
+
+    best
+}
+
+fn infer_struct_field_init_type_from_item<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    item: &'tcx hir::Item<'tcx>,
+    class_name: &str,
+    field_name: &str,
+) -> Option<LuaType> {
+    match &item.kind {
+        hir::ItemKind::Mod(_, module) => module.item_ids.iter().fold(None, |best, item_id| {
+            let candidate = infer_struct_field_init_type_from_item(
+                tcx,
+                tcx.hir_item(*item_id),
+                class_name,
+                field_name,
+            );
+            match candidate {
+                Some(candidate) => merge_body_inference(best, candidate),
+                None => best,
+            }
+        }),
+        hir::ItemKind::Fn { body, .. } => {
+            let body = tcx.hir_body(*body);
+            infer_struct_field_init_type_from_expr(tcx, body.value, class_name, field_name)
+        }
+        hir::ItemKind::Impl(impl_block) => {
+            impl_block.items.iter().fold(None, |best, impl_item_ref| {
+                let impl_item_id = hir::ImplItemId {
+                    owner_id: impl_item_ref.owner_id,
+                };
+                let impl_item = tcx.hir_impl_item(impl_item_id);
+                let candidate = match impl_item.kind {
+                    hir::ImplItemKind::Fn(_, body_id) => {
+                        let body = tcx.hir_body(body_id);
+                        infer_struct_field_init_type_from_expr(
+                            tcx, body.value, class_name, field_name,
+                        )
+                    }
+                    _ => None,
+                };
+                match candidate {
+                    Some(candidate) => merge_body_inference(best, candidate),
+                    None => best,
+                }
+            })
+        }
+        _ => None,
+    }
+}
+
+fn expr_userdata_container_name<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+) -> Option<String> {
+    let typeck = tcx.typeck(expr.hir_id.owner.def_id);
+    let mut ty = typeck.expr_ty(expr);
+
+    loop {
+        match ty.kind() {
+            ty::TyKind::Ref(_, inner, _) => ty = *inner,
+            ty::TyKind::Adt(..) => return Some(type_display_name(tcx, ty)),
+            _ => return None,
+        }
+    }
+}
+
+fn infer_struct_field_init_type_from_expr<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+    class_name: &str,
+    field_name: &str,
+) -> Option<LuaType> {
+    let expr = peel_try_expr(expr);
+
+    match &expr.kind {
+        hir::ExprKind::Struct(_, fields, tail) => fields
+            .iter()
+            .find(|field| {
+                expr_userdata_container_name(tcx, expr).as_deref() == Some(class_name)
+                    && field.ident.name.as_str() == field_name
+            })
+            .and_then(|field| infer_forwarded_userdata_state_type(tcx, field.expr))
+            .or_else(|| match tail {
+                hir::StructTailExpr::Base(base) => {
+                    infer_struct_field_init_type_from_expr(tcx, base, class_name, field_name)
+                }
+                _ => None,
+            }),
+        hir::ExprKind::Block(block, _) => block
+            .stmts
+            .iter()
+            .find_map(|stmt| match &stmt.kind {
+                hir::StmtKind::Let(local) => local.init.and_then(|init| {
+                    infer_struct_field_init_type_from_expr(tcx, init, class_name, field_name)
+                }),
+                hir::StmtKind::Expr(expr) | hir::StmtKind::Semi(expr) => {
+                    infer_struct_field_init_type_from_expr(tcx, expr, class_name, field_name)
+                }
+                _ => None,
+            })
+            .or_else(|| {
+                block.expr.and_then(|expr| {
+                    infer_struct_field_init_type_from_expr(tcx, expr, class_name, field_name)
+                })
+            }),
+        hir::ExprKind::Call(callee, args) => infer_struct_field_init_type_from_expr(
+            tcx, callee, class_name, field_name,
+        )
+        .or_else(|| {
+            args.iter().find_map(|arg| {
+                infer_struct_field_init_type_from_expr(tcx, arg, class_name, field_name)
+            })
+        }),
+        hir::ExprKind::MethodCall(_, receiver, args, _) => infer_struct_field_init_type_from_expr(
+            tcx, receiver, class_name, field_name,
+        )
+        .or_else(|| {
+            args.iter().find_map(|arg| {
+                infer_struct_field_init_type_from_expr(tcx, arg, class_name, field_name)
+            })
+        }),
+        hir::ExprKind::Match(scrutinee, arms, _) => infer_struct_field_init_type_from_expr(
+            tcx, scrutinee, class_name, field_name,
+        )
+        .or_else(|| {
+            arms.iter().find_map(|arm| {
+                infer_struct_field_init_type_from_expr(tcx, arm.body, class_name, field_name)
+            })
+        }),
+        hir::ExprKind::If(cond, then_expr, else_expr) => {
+            infer_struct_field_init_type_from_expr(tcx, cond, class_name, field_name)
+                .or_else(|| {
+                    infer_struct_field_init_type_from_expr(tcx, then_expr, class_name, field_name)
+                })
+                .or_else(|| {
+                    else_expr.and_then(|expr| {
+                        infer_struct_field_init_type_from_expr(tcx, expr, class_name, field_name)
+                    })
+                })
+        }
+        hir::ExprKind::Ret(Some(inner)) => {
+            infer_struct_field_init_type_from_expr(tcx, inner, class_name, field_name)
+        }
+        hir::ExprKind::Closure(closure) => {
+            let body = tcx.hir_body(closure.body);
+            infer_struct_field_init_type_from_expr(tcx, body.value, class_name, field_name)
+        }
+        _ => None,
+    }
+}
+
+fn infer_pairs_forward_returns(state: &LuaType) -> Vec<LuaReturn> {
+    let value = infer_pairs_value_type(state).unwrap_or(LuaType::Any);
+    vec![
+        LuaType::FunctionSig {
+            params: vec![state.clone()],
+            returns: vec![
+                LuaType::Optional(Box::new(LuaType::Integer)),
+                LuaType::Optional(Box::new(value)),
+            ],
+        }
+        .into(),
+        state.clone().into(),
+        LuaType::Nil.into(),
+    ]
+}
+
+fn infer_pairs_state_type<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+    state: &LuaType,
+) -> LuaType {
+    let LuaType::Class(name) = state else {
+        return state.clone();
+    };
+
+    // Handle bare "Iter" or "Iter<...>" (where the first generic arg is an
+    // internal Rust iterator type that shouldn't leak into Lua annotations).
+    let is_iter = name == "Iter" || name.starts_with("Iter<");
+    if !is_iter {
+        return state.clone();
+    }
+
+    // If the class name already carries a value type (second generic arg),
+    // extract it directly rather than re-inferring from the expression.
+    if let Some(value) = extract_iter_value_arg_from_class_name(name) {
+        return LuaType::Class(format!("Iter<any, {value}>"));
+    }
+
+    // Bare "Iter" — try to recover the value type from the expression.
+    let Some(value) = infer_iter_alias_value_type(tcx, expr)
+        .or_else(|| infer_iter_alias_value_type_from_wrapper_arg(tcx, expr))
+    else {
+        return state.clone();
+    };
+
+    LuaType::Class(format!("Iter<any, {value}>"))
+}
+
+/// Given a class name like `"Iter<SomeComplexType, Url>"`, extract the second
+/// generic argument (`"Url"`) if present.
+fn extract_iter_value_arg_from_class_name(name: &str) -> Option<String> {
+    let inner = name.strip_prefix("Iter<")?.strip_suffix('>')?;
+    // Split at top-level commas (respecting nested angle brackets).
+    let mut depth = 0i32;
+    let mut last_comma = None;
+    for (i, ch) in inner.char_indices() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            ',' if depth == 0 => last_comma = Some(i),
+            _ => {}
+        }
+    }
+    let comma_pos = last_comma?;
+    let value = inner[comma_pos + 1..].trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn infer_iter_alias_value_type<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+) -> Option<LuaType> {
+    let ty = tcx.typeck(expr.hir_id.owner.def_id).expr_ty(expr);
+    extract_iter_value_type_from_ty(tcx, ty)
+}
+
+fn infer_iter_alias_value_type_from_wrapper_arg<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+) -> Option<LuaType> {
+    let expr = peel_expr(peel_try_expr(expr));
+    let hir::ExprKind::MethodCall(_, _, args, _) = &expr.kind else {
+        return None;
+    };
+
+    args.get(1).and_then(|arg| {
+        let arg = peel_expr(peel_try_expr(arg));
+        if let hir::ExprKind::MethodCall(segment, receiver, _, _) = &arg.kind
+            && segment.ident.name.as_str() == "clone"
+        {
+            infer_iter_alias_value_type(tcx, receiver)
+        } else {
+            infer_iter_alias_value_type(tcx, arg)
+        }
+    })
+}
+
+fn extract_iter_value_type_from_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: ty::Ty<'tcx>) -> Option<LuaType> {
+    match ty.kind() {
+        ty::TyKind::Alias(_, alias) => extract_iter_value_type_from_ty(
+            tcx,
+            tcx.type_of(alias.def_id).instantiate(tcx, alias.args),
+        ),
+        ty::TyKind::Adt(adt_def, args) => {
+            let path = qualified_def_path_str(tcx, adt_def.did());
+            if path.ends_with("::Iter") || path == "Iter" {
+                args.types().nth(1).map(|ty| map_ty_to_lua(tcx, ty))
+            } else {
+                None
+            }
+        }
+        ty::TyKind::Ref(_, inner, _) => extract_iter_value_type_from_ty(tcx, *inner),
+        _ => None,
+    }
+}
+
+fn infer_pairs_value_type(state: &LuaType) -> Option<LuaType> {
+    let LuaType::Class(name) = state else {
+        return None;
+    };
+    if name == "Iter" {
+        return Some(LuaType::Any);
+    }
+    if let Some((base, args)) = parse_embedded_class_args(name) {
+        return (base == "Iter" && args.len() >= 2).then(|| args[1].clone());
+    }
+
+    None
+}
+
+fn parse_embedded_class_args(name: &str) -> Option<(&str, Vec<LuaType>)> {
+    let start = name.find('<')?;
+    let inner = name.get(start + 1..name.len().checked_sub(1)?)?;
+    name.ends_with('>').then_some(())?;
+
+    Some((
+        name[..start].trim(),
+        split_top_level(inner, ',')
+            .into_iter()
+            .map(lua_type_from_extracted_name)
+            .collect(),
+    ))
+}
+
 fn infer_returns_from_expr<'tcx>(
     tcx: TyCtxt<'tcx>,
     expr: &'tcx hir::Expr<'tcx>,
 ) -> Option<Vec<LuaReturn>> {
-    let expr = peel_try_expr(expr);
+    let expr = peel_expr(peel_try_expr(expr));
 
     match &expr.kind {
-        hir::ExprKind::MethodCall(segment, receiver, _args, _) => {
+        hir::ExprKind::MethodCall(segment, receiver, args, _) => {
             match segment.ident.name.as_str() {
                 "into_lua_multi" => Some(infer_into_lua_multi_returns(tcx, receiver)),
                 "into_lua" => Some(vec![infer_value_expr_lua_type(tcx, receiver).into()]),
+                _ if infer_forwarded_multivalue_returns(tcx, expr, segment, args).is_some() => {
+                    infer_forwarded_multivalue_returns(tcx, expr, segment, args)
+                }
                 _ => infer_wrapper_method_lua_type(tcx, expr).map(|ty| vec![ty.into()]),
             }
         }
@@ -6392,7 +7311,7 @@ fn infer_returns_from_expr<'tcx>(
             }
             None
         }
-        hir::ExprKind::Tup(items) if items.is_empty() => Some(Vec::new()),
+        hir::ExprKind::Tup([]) => Some(Vec::new()),
         hir::ExprKind::Block(block, _) => {
             let mut branches = Vec::new();
 
@@ -6430,12 +7349,16 @@ fn infer_returns_from_expr<'tcx>(
         }
         hir::ExprKind::Match(scrutinee, arms, source) => {
             let mut branches = Vec::new();
-            if matches!(source, hir::MatchSource::TryDesugar(_)) || is_result_like_expr(tcx, scrutinee) {
-                if let Some(returns) = infer_returns_from_expr(tcx, scrutinee) {
-                    branches.push(returns);
-                }
+            if (matches!(source, hir::MatchSource::TryDesugar(_))
+                || is_result_like_expr(tcx, scrutinee))
+                && let Some(returns) = infer_returns_from_expr(tcx, scrutinee)
+            {
+                branches.push(returns);
             }
-            branches.extend(arms.iter().filter_map(|arm| infer_returns_from_expr(tcx, arm.body)));
+            branches.extend(
+                arms.iter()
+                    .filter_map(|arm| infer_returns_from_expr(tcx, arm.body)),
+            );
             merge_return_branches(branches)
         }
         hir::ExprKind::If(_, then_expr, else_expr) => {
@@ -6498,7 +7421,7 @@ fn infer_into_lua_multi_returns<'tcx>(
     let receiver_ty = typeck.expr_ty(receiver);
 
     if let ty::TyKind::Tuple(fields) = receiver_ty.kind() {
-        let names = extract_tuple_element_names(tcx, receiver);
+        let names = extract_tuple_element_names(receiver);
         return fields
             .iter()
             .enumerate()
@@ -6557,27 +7480,24 @@ fn merge_return_branches(branches: Vec<Vec<LuaReturn>>) -> Option<Vec<LuaReturn>
 /// Works on `Ok((a.x, a.y, z))` and bare `(a.x, a.y, z)` patterns.
 /// Enriches existing typed returns with names when the tuple element count matches.
 fn enrich_return_names<'tcx>(
-    tcx: TyCtxt<'tcx>,
+    _tcx: TyCtxt<'tcx>,
     body: &'tcx hir::Expr<'tcx>,
     returns: &mut [LuaReturn],
 ) {
     if returns.len() < 2 || returns.iter().any(|r| r.name.is_some()) {
         return;
     }
-    if let Some(names) = find_return_tuple_names(tcx, body) {
-        if names.len() == returns.len() {
-            for (ret, name) in returns.iter_mut().zip(names) {
-                ret.name = name;
-            }
+    if let Some(names) = find_return_tuple_names(body)
+        && names.len() == returns.len()
+    {
+        for (ret, name) in returns.iter_mut().zip(names) {
+            ret.name = name;
         }
     }
 }
 
 /// Walk the body to find the return tuple expression and extract element names.
-fn find_return_tuple_names<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    expr: &'tcx hir::Expr<'tcx>,
-) -> Option<Vec<Option<String>>> {
+fn find_return_tuple_names<'tcx>(expr: &'tcx hir::Expr<'tcx>) -> Option<Vec<Option<String>>> {
     match &expr.kind {
         // Ok((a, b, c)) — unwrap the Ok() call
         hir::ExprKind::Call(callee, args) => {
@@ -6589,7 +7509,7 @@ fn find_return_tuple_names<'tcx>(
                     hir::QPath::TypeRelative(_, seg) => Some(seg.ident.name.as_str()),
                 };
                 if matches!(name, Some("Ok" | "Some")) && args.len() == 1 {
-                    return find_return_tuple_names(tcx, &args[0]);
+                    return find_return_tuple_names(&args[0]);
                 }
             }
             None
@@ -6601,18 +7521,18 @@ fn find_return_tuple_names<'tcx>(
         // Block — check tail expression
         hir::ExprKind::Block(block, _) => {
             if let Some(tail) = block.expr {
-                return find_return_tuple_names(tcx, tail);
+                return find_return_tuple_names(tail);
             }
             None
         }
         // Match (try desugar `?`) — look through
         hir::ExprKind::Match(scrut, _, hir::MatchSource::TryDesugar(_)) => {
-            find_return_tuple_names(tcx, scrut)
+            find_return_tuple_names(scrut)
         }
         // Regular match — check first arm
         hir::ExprKind::Match(_, arms, _) => {
             for arm in *arms {
-                if let Some(names) = find_return_tuple_names(tcx, arm.body) {
+                if let Some(names) = find_return_tuple_names(arm.body) {
                     return Some(names);
                 }
             }
@@ -6712,16 +7632,13 @@ fn extract_return_name(expr: &hir::Expr<'_>) -> Option<String> {
 }
 
 /// Extract names from a tuple expression's elements.
-fn extract_tuple_element_names<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    receiver: &'tcx hir::Expr<'tcx>,
-) -> Vec<Option<String>> {
+fn extract_tuple_element_names<'tcx>(receiver: &'tcx hir::Expr<'tcx>) -> Vec<Option<String>> {
     match &receiver.kind {
         hir::ExprKind::Tup(elements) => elements.iter().map(|e| extract_return_name(e)).collect(),
         // Look through blocks to find the tuple
         hir::ExprKind::Block(block, _) => {
             if let Some(tail) = block.expr {
-                return extract_tuple_element_names(tcx, tail);
+                return extract_tuple_element_names(tail);
             }
             Vec::new()
         }
@@ -6740,20 +7657,20 @@ fn find_into_lua_multi_tuple<'tcx>(
             if segment.ident.name.as_str() == "into_lua_multi" {
                 let typeck = tcx.typeck(receiver.hir_id.owner.def_id);
                 let receiver_ty = typeck.expr_ty(receiver);
-                if let ty::TyKind::Tuple(fields) = receiver_ty.kind() {
-                    if !fields.is_empty() {
-                        let names = extract_tuple_element_names(tcx, receiver);
-                        let returns: Vec<LuaReturn> = fields
-                            .iter()
-                            .enumerate()
-                            .map(|(i, t)| {
-                                let ty = map_ty_to_lua(tcx, t);
-                                let name = names.get(i).and_then(|n| n.clone());
-                                LuaReturn { ty, name }
-                            })
-                            .collect();
-                        return Some(returns);
-                    }
+                if let ty::TyKind::Tuple(fields) = receiver_ty.kind()
+                    && !fields.is_empty()
+                {
+                    let names = extract_tuple_element_names(receiver);
+                    let returns: Vec<LuaReturn> = fields
+                        .iter()
+                        .enumerate()
+                        .map(|(i, t)| {
+                            let ty = map_ty_to_lua(tcx, t);
+                            let name = names.get(i).and_then(|n| n.clone());
+                            LuaReturn { ty, name }
+                        })
+                        .collect();
+                    return Some(returns);
                 }
             }
             // Recurse
@@ -6763,16 +7680,16 @@ fn find_into_lua_multi_tuple<'tcx>(
             None
         }
         hir::ExprKind::Block(block, _) => {
-            if let Some(tail) = block.expr {
-                if let Some(r) = find_into_lua_multi_tuple(tcx, tail) {
-                    return Some(r);
-                }
+            if let Some(tail) = block.expr
+                && let Some(r) = find_into_lua_multi_tuple(tcx, tail)
+            {
+                return Some(r);
             }
             for stmt in block.stmts {
-                if let hir::StmtKind::Semi(e) | hir::StmtKind::Expr(e) = &stmt.kind {
-                    if let Some(r) = find_into_lua_multi_tuple(tcx, e) {
-                        return Some(r);
-                    }
+                if let hir::StmtKind::Semi(e) | hir::StmtKind::Expr(e) = &stmt.kind
+                    && let Some(r) = find_into_lua_multi_tuple(tcx, e)
+                {
+                    return Some(r);
                 }
             }
             None
@@ -6830,10 +7747,10 @@ fn find_into_lua_receiver_type<'tcx>(
         hir::ExprKind::MethodCall(segment, receiver, args, _) => {
             let name = segment.ident.name.as_str();
             if name == "into_lua" || name == "into_lua_multi" {
-                if let Some(ty) = infer_wrapper_method_lua_type(tcx, receiver) {
-                    if is_informative(&ty) {
-                        return Some(ty);
-                    }
+                if let Some(ty) = infer_wrapper_method_lua_type(tcx, receiver)
+                    && is_informative(&ty)
+                {
+                    return Some(ty);
                 }
                 let typeck = tcx.typeck(receiver.hir_id.owner.def_id);
                 let receiver_ty = typeck.expr_ty(receiver);
@@ -6853,10 +7770,10 @@ fn find_into_lua_receiver_type<'tcx>(
                 }
                 // If receiver is AnyUserData, try to resolve the class from the
                 // expression that produced it (e.g. TypeName::make(...))
-                if is_any_user_data(tcx, receiver_ty) {
-                    if let Some(class) = resolve_any_user_data_class(tcx, receiver) {
-                        return Some(class);
-                    }
+                if is_any_user_data(tcx, receiver_ty)
+                    && let Some(class) = resolve_any_user_data_class(tcx, receiver)
+                {
+                    return Some(class);
                 }
             }
             // Recurse into receiver and args
@@ -6878,10 +7795,10 @@ fn find_into_lua_receiver_type<'tcx>(
             }
 
             for stmt in block.stmts {
-                if let hir::StmtKind::Let(hir::LetStmt { init: Some(e), .. }) = &stmt.kind {
-                    if let Some(ty) = find_into_lua_receiver_type(tcx, e) {
-                        return Some(ty);
-                    }
+                if let hir::StmtKind::Let(hir::LetStmt { init: Some(e), .. }) = &stmt.kind
+                    && let Some(ty) = find_into_lua_receiver_type(tcx, e)
+                {
+                    return Some(ty);
                 }
             }
             None
@@ -6947,10 +7864,10 @@ fn find_into_lua_receiver_type<'tcx>(
             if let Some(ty) = find_into_lua_receiver_type(tcx, then_expr) {
                 branch_types.push(ty);
             }
-            if let Some(else_e) = else_expr {
-                if let Some(ty) = find_into_lua_receiver_type(tcx, else_e) {
-                    branch_types.push(ty);
-                }
+            if let Some(else_e) = else_expr
+                && let Some(ty) = find_into_lua_receiver_type(tcx, else_e)
+            {
+                branch_types.push(ty);
             }
             if branch_types.is_empty() {
                 None
@@ -6990,19 +7907,19 @@ fn infer_from_expr<'tcx>(
         // Ok(expr) — unwrap and check the inner expression
         // LuaValue::Variant(...) — direct Value construction
         hir::ExprKind::Call(callee, args) => {
-            if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = &callee.kind {
-                if let Some(seg) = path.segments.last() {
-                    if seg.ident.name.as_str() == "Ok" && args.len() == 1 {
-                        return infer_from_expr(tcx, typeck, &args[0]);
-                    }
-                }
+            if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = &callee.kind
+                && let Some(seg) = path.segments.last()
+                && seg.ident.name.as_str() == "Ok"
+                && args.len() == 1
+            {
+                return infer_from_expr(tcx, typeck, &args[0]);
             }
-            if let Some(local) = expr_def_id(tcx, callee).and_then(|def_id| def_id.as_local()) {
-                if let Some(inferred) = infer_local_fn_body_return(tcx, local) {
-                    let call_ty = map_ty_to_lua(tcx, typeck.expr_ty(expr));
-                    if should_prefer_body_inference(&call_ty, &inferred) {
-                        return Some(inferred);
-                    }
+            if let Some(local) = expr_def_id(tcx, callee).and_then(|def_id| def_id.as_local())
+                && let Some(inferred) = infer_local_fn_body_return(tcx, local)
+            {
+                let call_ty = map_ty_to_lua(tcx, typeck.expr_ty(expr));
+                if should_prefer_body_inference(&call_ty, &inferred) {
+                    return Some(inferred);
                 }
             }
             let callee_inferred = match &callee.kind {
@@ -7023,9 +7940,7 @@ fn infer_from_expr<'tcx>(
             // For function calls, check the return type
             let call_ty = typeck.expr_ty(expr);
             let lua_ty = map_ty_to_lua(tcx, call_ty);
-            if is_informative(&lua_ty) {
-                Some(lua_ty)
-            } else if matches!(lua_ty, LuaType::Variadic(_)) {
+            if is_informative(&lua_ty) || matches!(lua_ty, LuaType::Variadic(_)) {
                 Some(lua_ty)
             } else {
                 None
@@ -7034,17 +7949,18 @@ fn infer_from_expr<'tcx>(
 
         // Method call chains: expr.method().method2() — check the overall type
         hir::ExprKind::MethodCall(segment, receiver, args, _) => {
-            if let Some(ty) = infer_wrapper_method_lua_type(tcx, expr) {
-                if is_informative(&ty) {
-                    return Some(ty);
-                }
+            if let Some(ty) = infer_wrapper_method_lua_type(tcx, expr)
+                && is_informative(&ty)
+            {
+                return Some(ty);
             }
 
             let method_name = segment.ident.name.as_str();
             let call_ty = typeck.expr_ty(expr);
             let lua_ty = map_ty_to_lua(tcx, call_ty);
             if matches!(method_name, "map" | "and_then")
-                && let Some(mapped) = infer_mapped_method_result(tcx, typeck, receiver, args, method_name)
+                && let Some(mapped) =
+                    infer_mapped_method_result(tcx, typeck, receiver, args, method_name)
                 && should_prefer_body_inference(&lua_ty, &mapped)
             {
                 return Some(rewrap_erased_body_inference(&lua_ty, &mapped));
@@ -7088,10 +8004,10 @@ fn infer_from_expr<'tcx>(
                 return infer_from_expr(tcx, typeck, tail);
             }
             // Check last statement if it's an expression
-            if let Some(stmt) = block.stmts.last() {
-                if let hir::StmtKind::Semi(e) | hir::StmtKind::Expr(e) = &stmt.kind {
-                    return infer_from_expr(tcx, typeck, e);
-                }
+            if let Some(stmt) = block.stmts.last()
+                && let hir::StmtKind::Semi(e) | hir::StmtKind::Expr(e) = &stmt.kind
+            {
+                return infer_from_expr(tcx, typeck, e);
             }
             None
         }
@@ -7135,10 +8051,10 @@ fn infer_from_expr<'tcx>(
             if let Some(ty) = infer_from_expr(tcx, typeck, then_expr) {
                 branch_types.push(ty);
             }
-            if let Some(else_e) = else_expr {
-                if let Some(ty) = infer_from_expr(tcx, typeck, else_e) {
-                    branch_types.push(ty);
-                }
+            if let Some(else_e) = else_expr
+                && let Some(ty) = infer_from_expr(tcx, typeck, else_e)
+            {
+                branch_types.push(ty);
             }
             if branch_types.is_empty() {
                 None
@@ -7151,6 +8067,17 @@ fn infer_from_expr<'tcx>(
 
         // LuaValue::Variant path (no args, e.g. LuaValue::Nil)
         hir::ExprKind::Path(_) => {
+            if let Some(inferred) =
+                local_binding_info(tcx, expr).and_then(|(_target, body, binding)| {
+                    infer_userdata_binding_type_from_body(tcx, body.value, &binding)
+                })
+            {
+                let ty = typeck.expr_ty(expr);
+                let lua_ty = map_ty_to_lua(tcx, ty);
+                if is_better_inferred_type(&lua_ty, &inferred) || !is_informative(&lua_ty) {
+                    return Some(inferred);
+                }
+            }
             if let Some(inferred) = infer_local_table_binding_type(tcx, expr) {
                 let ty = typeck.expr_ty(expr);
                 let lua_ty = map_ty_to_lua(tcx, ty);
@@ -7226,40 +8153,6 @@ fn visit_expr_for_fields<'tcx>(
     fields: &mut Vec<LuaField>,
 ) {
     match &expr.kind {
-        hir::ExprKind::Block(block, _) => {
-            for stmt in block.stmts {
-                match &stmt.kind {
-                    hir::StmtKind::Semi(e) | hir::StmtKind::Expr(e) => {
-                        visit_expr_for_fields(tcx, e, fields);
-                    }
-                    hir::StmtKind::Let(local) => {
-                        if let Some(init) = local.init {
-                            visit_expr_for_fields(tcx, init, fields);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            if let Some(e) = block.expr {
-                visit_expr_for_fields(tcx, e, fields);
-            }
-        }
-        hir::ExprKind::If(cond, then_block, else_block) => {
-            visit_expr_for_fields(tcx, cond, fields);
-            visit_expr_for_fields(tcx, then_block, fields);
-            if let Some(else_expr) = else_block {
-                visit_expr_for_fields(tcx, else_expr, fields);
-            }
-        }
-        hir::ExprKind::Match(scrutinee, arms, _) => {
-            visit_expr_for_fields(tcx, scrutinee, fields);
-            for arm in *arms {
-                visit_expr_for_fields(tcx, arm.body, fields);
-            }
-        }
-        hir::ExprKind::Loop(block, _, _, _) => {
-            walk_loop_body!(block, |e| visit_expr_for_fields(tcx, e, fields));
-        }
         hir::ExprKind::MethodCall(segment, _receiver, args, _span) => {
             let method_name = segment.ident.name.as_str();
             match method_name {
@@ -7275,18 +8168,13 @@ fn visit_expr_for_fields<'tcx>(
                 }
                 // Setter variants
                 "add_field_method_set" | "add_field_function_set" => {
-                    if !args.is_empty() {
-                        if let Some(name) = extract_string_literal(&args[0]) {
-                            if let Some(existing) = fields.iter_mut().find(|f| f.name == name) {
-                                existing.writable = true;
-                            } else {
-                                fields.push(LuaField {
-                                    name,
-                                    ty: LuaType::Any,
-                                    writable: true,
-                                    doc: None,
-                                });
-                            }
+                    if !args.is_empty()
+                        && let Some(name) = extract_string_literal(&args[0])
+                    {
+                        if let Some(existing) = fields.iter_mut().find(|f| f.name == name) {
+                            existing.writable = true;
+                        } else {
+                            fields.push(writable_field(name, LuaType::Any));
                         }
                     }
                 }
@@ -7294,20 +8182,15 @@ fn visit_expr_for_fields<'tcx>(
                 // We can't easily infer the type from a value expression,
                 // but we can try to get it from typeck
                 "add_field" | "add_meta_field" => {
-                    if !args.is_empty() {
-                        if let Some(name) = extract_string_literal(&args[0]) {
-                            let ty = if args.len() >= 2 {
-                                infer_expr_lua_type(tcx, &args[1])
-                            } else {
-                                LuaType::Any
-                            };
-                            fields.push(LuaField {
-                                name,
-                                ty,
-                                writable: false,
-                                doc: None,
-                            });
-                        }
+                    if !args.is_empty()
+                        && let Some(name) = extract_string_literal(&args[0])
+                    {
+                        let ty = if args.len() >= 2 {
+                            infer_expr_lua_type(tcx, &args[1])
+                        } else {
+                            LuaType::Any
+                        };
+                        fields.push(readonly_field(name, ty));
                     }
                 }
                 // Computed meta field: add_meta_field_with("name", |lua| -> value)
@@ -7319,7 +8202,11 @@ fn visit_expr_for_fields<'tcx>(
                 _ => {}
             }
         }
-        _ => {}
+        _ => {
+            visit_recursive_expr_children(expr, |child| {
+                visit_expr_for_fields(tcx, child, fields);
+            });
+        }
     }
 }
 
@@ -7353,28 +8240,26 @@ fn extract_field_getter<'tcx>(
     let body = tcx.hir_body(closure.body);
     let inferred_body_ty = infer_field_closure_result(tcx, body.value)
         .or_else(|| infer_concrete_type_from_body(tcx, body.value));
+    let inferred_body_trace =
+        should_trace_field_name(&name).then(|| format!("{inferred_body_ty:?}"));
 
     // When the closure returns Result<Value> (→ Any), try to infer the concrete
     // type by walking the closure body for constructor expressions. This handles
     // cached_field! macros where the type is erased to Value by .into_lua().
-    if let Some(inferred) = inferred_body_ty.as_ref()
-        && should_prefer_body_inference(&ty, inferred)
+    if let Some(inferred) = inferred_body_ty
+        && should_prefer_body_inference(&ty, &inferred)
     {
-        ty = inferred.clone();
+        ty = inferred;
     }
 
     if should_trace_field_name(&name) {
         trace(format!(
-            "extract_field_getter name={name} sig_ty={:?} inferred={inferred_body_ty:?} final={ty:?} body={}",
+            "extract_field_getter name={name} sig_ty={:?} inferred={} final={ty:?} body={}",
             map_ty_to_lua(tcx, ret_ty),
+            inferred_body_trace.as_deref().unwrap_or("None"),
             expr_snippet(tcx, body.value)
         ));
     }
 
-    Some(LuaField {
-        name,
-        ty,
-        writable: false,
-        doc: None,
-    })
+    Some(readonly_field(name, ty))
 }

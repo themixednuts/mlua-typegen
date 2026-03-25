@@ -1,6 +1,16 @@
-use crate::{CodegenTarget, LuaApi, LuaClass, LuaEnum, LuaFunction, LuaModule, LuaType, MethodKind};
+use crate::{
+    CodegenTarget, LuaApi, LuaClass, LuaEnum, LuaFunction, LuaModule, LuaType, MethodKind,
+};
 use std::fmt::Write;
 use std::path::Path;
+
+fn should_trace_codegen_class(name: &str) -> bool {
+    matches!(name, "Access" | "Path" | "Url" | "Style" | "File" | "Tab")
+}
+
+fn should_trace_codegen_global(name: &str) -> bool {
+    matches!(name, "Url" | "Path" | "File")
+}
 
 /// Generates LuaCATS stub content for a complete API.
 pub fn generate_stubs(api: &LuaApi) -> String {
@@ -25,6 +35,11 @@ pub fn generate_stubs_for(api: &LuaApi, target: CodegenTarget) -> String {
     for module in &api.modules {
         writeln!(out).unwrap();
         write_module(&mut out, module, target);
+    }
+
+    for field in &api.global_fields {
+        writeln!(out).unwrap();
+        write_global_field(&mut out, field);
     }
 
     for func in &api.global_functions {
@@ -61,18 +76,20 @@ fn write_enum(out: &mut String, e: &LuaEnum, _target: CodegenTarget) {
 
 fn write_class(out: &mut String, class: &LuaClass, target: CodegenTarget) {
     write_doc(out, &class.doc);
+    let class_decl = class.name.as_str();
+    let class_value = class_decl.split('<').next().unwrap_or(class_decl);
     match target {
         CodegenTarget::LuaLS => {
-            writeln!(out, "---@class {}", class.name).unwrap();
+            writeln!(out, "---@class {class_decl}").unwrap();
         }
         CodegenTarget::EmmyLua => {
-            writeln!(out, "---@class (exact) {}", class.name).unwrap();
+            writeln!(out, "---@class (exact) {class_decl}").unwrap();
         }
     }
     for field in &class.fields {
         write_field(out, field);
     }
-    writeln!(out, "local {} = {{}}", class.name).unwrap();
+    writeln!(out, "local {class_value} = {{}}").unwrap();
 
     // Detect overloaded methods (same name, multiple definitions)
     let mut method_counts = std::collections::HashMap::new();
@@ -86,20 +103,19 @@ fn write_class(out: &mut String, class: &LuaClass, target: CodegenTarget) {
             // Write as @overload — only on first occurrence
             if written_overloads.insert(&method.name) {
                 writeln!(out).unwrap();
-                write_overloaded_method(out, &class.name, &class.methods, &method.name, target);
+                write_overloaded_method(out, class_value, &class.methods, &method.name, target);
             }
         } else {
             writeln!(out).unwrap();
-            write_method(out, &class.name, method, target);
+            write_method(out, class_value, method, target);
         }
     }
 }
 
 /// Lua reserved keywords that must be quoted in field names.
 const LUA_KEYWORDS: &[&str] = &[
-    "and", "break", "do", "else", "elseif", "end", "false", "for", "function",
-    "goto", "if", "in", "local", "nil", "not", "or", "repeat", "return",
-    "then", "true", "until", "while",
+    "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "goto", "if", "in",
+    "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while",
 ];
 
 /// Format a field name, quoting it if it's a Lua keyword or not a valid identifier.
@@ -129,7 +145,12 @@ fn write_field(out: &mut String, field: &crate::LuaField) {
     let readonly = if field.writable { "" } else { " (readonly)" };
     if let Some(doc) = &field.doc {
         let first_line = doc.lines().next().unwrap_or("");
-        writeln!(out, "---@field {name} {}{} {first_line}", field.ty, readonly).unwrap();
+        writeln!(
+            out,
+            "---@field {name} {}{} {first_line}",
+            field.ty, readonly
+        )
+        .unwrap();
     } else {
         writeln!(out, "---@field {name} {}{}", field.ty, readonly).unwrap();
     }
@@ -151,18 +172,28 @@ fn write_overloaded_method(
 
     // Write @overload annotations for each variant
     for method in &overloads {
-        let params_sig = method.params.iter().map(|p| {
-            if let LuaType::Variadic(inner) = &p.ty {
-                format!("...: {inner}")
-            } else {
-                format!("{}: {}", p.name, p.ty)
-            }
-        }).collect::<Vec<_>>().join(", ");
+        let params_sig = method
+            .params
+            .iter()
+            .map(|p| {
+                if let LuaType::Variadic(inner) = &p.ty {
+                    format!("...: {inner}")
+                } else {
+                    format!("{}: {}", p.name, p.ty)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
 
         let ret_sig = if method.returns.is_empty() {
             String::new()
         } else {
-            let rets = method.returns.iter().map(|r| r.ty.to_string()).collect::<Vec<_>>().join(", ");
+            let rets = method
+                .returns
+                .iter()
+                .map(|r| r.ty.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
             format!(": {rets}")
         };
 
@@ -180,7 +211,12 @@ fn write_overloaded_method(
     writeln!(out, "function {class_name}{escaped}({params_str}) end").unwrap();
 }
 
-fn write_method(out: &mut String, class_name: &str, method: &crate::LuaMethod, _target: CodegenTarget) {
+fn write_method(
+    out: &mut String,
+    class_name: &str,
+    method: &crate::LuaMethod,
+    _target: CodegenTarget,
+) {
     write_doc(out, &method.doc);
     if method.is_async {
         writeln!(out, "---@async").unwrap();
@@ -251,18 +287,28 @@ fn write_overloaded_function(
     }
 
     for func in &overloads {
-        let params_sig = func.params.iter().map(|p| {
-            if let LuaType::Variadic(inner) = &p.ty {
-                format!("...: {inner}")
-            } else {
-                format!("{}: {}", p.name, p.ty)
-            }
-        }).collect::<Vec<_>>().join(", ");
+        let params_sig = func
+            .params
+            .iter()
+            .map(|p| {
+                if let LuaType::Variadic(inner) = &p.ty {
+                    format!("...: {inner}")
+                } else {
+                    format!("{}: {}", p.name, p.ty)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
 
         let ret_sig = if func.returns.is_empty() {
             String::new()
         } else {
-            let rets = func.returns.iter().map(|r| r.ty.to_string()).collect::<Vec<_>>().join(", ");
+            let rets = func
+                .returns
+                .iter()
+                .map(|r| r.ty.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
             format!(": {rets}")
         };
 
@@ -275,7 +321,12 @@ fn write_overloaded_function(
     writeln!(out, "function {namespace}{escaped}({params_str}) end").unwrap();
 }
 
-fn write_namespaced_function(out: &mut String, namespace: &str, func: &LuaFunction, _target: CodegenTarget) {
+fn write_namespaced_function(
+    out: &mut String,
+    namespace: &str,
+    func: &LuaFunction,
+    _target: CodegenTarget,
+) {
     write_doc(out, &func.doc);
     if func.is_async {
         writeln!(out, "---@async").unwrap();
@@ -299,6 +350,12 @@ fn write_global_function(out: &mut String, func: &LuaFunction, _target: CodegenT
     // If someone registers a keyword as a global, it'll produce invalid Lua,
     // but that's inherently broken usage. We emit it as-is.
     writeln!(out, "function {}({params_str}) end", func.name).unwrap();
+}
+
+fn write_global_field(out: &mut String, field: &crate::LuaField) {
+    write_doc(out, &field.doc);
+    writeln!(out, "---@type {}", field.ty).unwrap();
+    writeln!(out, "{} = {}", field.name, field.name).unwrap();
 }
 
 /// Write `---@param` annotations, with special handling for variadic params.
@@ -345,8 +402,37 @@ pub fn write_stubs(output_dir: &Path, api: &LuaApi, crate_name: &str) -> std::io
 
 /// Writes stub files to the output directory for a specific language server target.
 /// Each crate gets its own file (`<crate_name>.lua`) so workspace builds don't overwrite.
-pub fn write_stubs_for(output_dir: &Path, api: &LuaApi, target: CodegenTarget, crate_name: &str) -> std::io::Result<()> {
+pub fn write_stubs_for(
+    output_dir: &Path,
+    api: &LuaApi,
+    target: CodegenTarget,
+    crate_name: &str,
+) -> std::io::Result<()> {
     std::fs::create_dir_all(output_dir)?;
+
+    if std::env::var("MLUA_TYPEGEN_TRACE").is_ok() && crate_name == "yazi_binding" {
+        for class in &api.classes {
+            if should_trace_codegen_class(&class.name) {
+                eprintln!(
+                    "[mlua-typegen] codegen class {} methods={:?}",
+                    class.name,
+                    class
+                        .methods
+                        .iter()
+                        .map(|m| (&m.name, &m.params, &m.returns))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        for func in &api.global_functions {
+            if should_trace_codegen_global(&func.name) {
+                eprintln!(
+                    "[mlua-typegen] codegen global_function {} params={:?} returns={:?}",
+                    func.name, func.params, func.returns
+                );
+            }
+        }
+    }
 
     let content = generate_stubs_for(api, target);
     let filename = format!("{crate_name}.lua");
@@ -432,6 +518,18 @@ mod tests {
     }
 
     #[test]
+    fn display_optional_union() {
+        assert_eq!(
+            LuaType::Optional(Box::new(LuaType::Union(vec![
+                LuaType::String,
+                LuaType::Number
+            ])))
+            .to_string(),
+            "(string | number)?"
+        );
+    }
+
+    #[test]
     fn display_optional_array() {
         assert_eq!(
             LuaType::Optional(Box::new(LuaType::Array(Box::new(LuaType::Integer)))).to_string(),
@@ -461,10 +559,7 @@ mod tests {
 
     #[test]
     fn display_class() {
-        assert_eq!(
-            LuaType::Class("MyClass".to_string()).to_string(),
-            "MyClass"
-        );
+        assert_eq!(LuaType::Class("MyClass".to_string()).to_string(), "MyClass");
     }
 
     #[test]
@@ -503,7 +598,11 @@ mod tests {
     #[test]
     fn display_function_sig_no_args() {
         assert_eq!(
-            LuaType::FunctionSig { params: vec![], returns: vec![] }.to_string(),
+            LuaType::FunctionSig {
+                params: vec![],
+                returns: vec![]
+            }
+            .to_string(),
             "fun()"
         );
     }
@@ -513,7 +612,7 @@ mod tests {
         assert_eq!(
             LuaType::FunctionSig {
                 params: vec![LuaType::Integer, LuaType::String],
-                returns: vec![LuaType::Boolean.into()],
+                returns: vec![LuaType::Boolean],
             }
             .to_string(),
             "fun(p1: integer, p2: string): boolean"
@@ -525,7 +624,7 @@ mod tests {
         assert_eq!(
             LuaType::FunctionSig {
                 params: vec![LuaType::Any],
-                returns: vec![LuaType::String.into(), LuaType::Integer.into()],
+                returns: vec![LuaType::String, LuaType::Integer],
             }
             .to_string(),
             "fun(p1: any): string, integer"
@@ -589,9 +688,10 @@ mod tests {
                         kind: MethodKind::Method,
                         is_async: false,
                         params: vec![],
-                        returns: vec![LuaType::Array(Box::new(LuaType::Class(
-                            "Diagnostic".to_string(),
-                        ))).into()],
+                        returns: vec![
+                            LuaType::Array(Box::new(LuaType::Class("Diagnostic".to_string())))
+                                .into(),
+                        ],
                         doc: None,
                     },
                     LuaMethod {
@@ -664,8 +764,18 @@ function Buffer.create(path) end
                 name: "Point".to_string(),
                 doc: None,
                 fields: vec![
-                    LuaField { name: "x".to_string(), ty: LuaType::Number, writable: false, doc: None },
-                    LuaField { name: "y".to_string(), ty: LuaType::Number, writable: false, doc: None },
+                    LuaField {
+                        name: "x".to_string(),
+                        ty: LuaType::Number,
+                        writable: false,
+                        doc: None,
+                    },
+                    LuaField {
+                        name: "y".to_string(),
+                        ty: LuaType::Number,
+                        writable: false,
+                        doc: None,
+                    },
                 ],
                 methods: vec![],
             }],
@@ -774,8 +884,18 @@ function fs.exists(path) end
                 name: "constants".to_string(),
                 doc: None,
                 fields: vec![
-                    LuaField { name: "VERSION".to_string(), ty: LuaType::String, writable: false, doc: None },
-                    LuaField { name: "MAX_SIZE".to_string(), ty: LuaType::Integer, writable: false, doc: None },
+                    LuaField {
+                        name: "VERSION".to_string(),
+                        ty: LuaType::String,
+                        writable: false,
+                        doc: None,
+                    },
+                    LuaField {
+                        name: "MAX_SIZE".to_string(),
+                        ty: LuaType::Integer,
+                        writable: false,
+                        doc: None,
+                    },
                 ],
                 functions: vec![],
             }],
@@ -791,6 +911,7 @@ function fs.exists(path) end
     #[test]
     fn generates_global_functions() {
         let api = LuaApi {
+            global_fields: vec![],
             global_functions: vec![LuaFunction {
                 name: "print_colored".to_string(),
                 is_async: false,
@@ -824,6 +945,7 @@ function print_colored(msg, color) end
     #[test]
     fn generates_global_function_no_params_no_return() {
         let api = LuaApi {
+            global_fields: vec![],
             global_functions: vec![LuaFunction {
                 name: "noop".to_string(),
                 is_async: false,
@@ -835,6 +957,22 @@ function print_colored(msg, color) end
         };
         let output = generate_stubs(&api);
         assert!(output.contains("function noop() end\n"));
+    }
+
+    #[test]
+    fn generates_global_fields() {
+        let api = LuaApi {
+            global_fields: vec![crate::LuaField {
+                name: "rt".to_string(),
+                ty: LuaType::Table,
+                writable: true,
+                doc: None,
+            }],
+            ..Default::default()
+        };
+
+        let output = generate_stubs(&api);
+        assert!(output.contains("---@type table\nrt = rt\n"));
     }
 
     // ── Codegen: async tests ───────────────────────────────────────────
@@ -862,12 +1000,15 @@ function print_colored(msg, color) end
         };
 
         let output = generate_stubs(&api);
-        assert!(output.contains("---@async\n---@param url string\n---@return string\nfunction Http:fetch(url) end"));
+        assert!(output.contains(
+            "---@async\n---@param url string\n---@return string\nfunction Http:fetch(url) end"
+        ));
     }
 
     #[test]
     fn generates_async_global_function() {
         let api = LuaApi {
+            global_fields: vec![],
             global_functions: vec![LuaFunction {
                 name: "sleep".to_string(),
                 is_async: true,
@@ -905,7 +1046,9 @@ function print_colored(msg, color) end
             ..Default::default()
         };
         let output = generate_stubs(&api);
-        assert!(output.contains("---@async\n---@param url string\n---@return table\nfunction net.request(url) end"));
+        assert!(output.contains(
+            "---@async\n---@param url string\n---@return table\nfunction net.request(url) end"
+        ));
     }
 
     // ── Codegen: multi-return tests ────────────────────────────────────
@@ -939,17 +1082,24 @@ function print_colored(msg, color) end
     #[test]
     fn generates_triple_return() {
         let api = LuaApi {
+            global_fields: vec![],
             global_functions: vec![LuaFunction {
                 name: "get_rgb".to_string(),
                 is_async: false,
                 params: vec![],
-                returns: vec![LuaType::Integer.into(), LuaType::Integer.into(), LuaType::Integer.into()],
+                returns: vec![
+                    LuaType::Integer.into(),
+                    LuaType::Integer.into(),
+                    LuaType::Integer.into(),
+                ],
                 doc: None,
             }],
             ..Default::default()
         };
         let output = generate_stubs(&api);
-        assert!(output.contains("---@return integer\n---@return integer\n---@return integer\nfunction get_rgb() end"));
+        assert!(output.contains(
+            "---@return integer\n---@return integer\n---@return integer\nfunction get_rgb() end"
+        ));
     }
 
     // ── Codegen: variadic param tests ──────────────────────────────────
@@ -957,6 +1107,7 @@ function print_colored(msg, color) end
     #[test]
     fn generates_variadic_param() {
         let api = LuaApi {
+            global_fields: vec![],
             global_functions: vec![LuaFunction {
                 name: "log".to_string(),
                 is_async: false,
@@ -976,12 +1127,17 @@ function print_colored(msg, color) end
             ..Default::default()
         };
         let output = generate_stubs(&api);
-        assert!(output.contains("---@param level string\n---@param ... any\nfunction log(level, ...) end"));
+        assert!(
+            output.contains(
+                "---@param level string\n---@param ... any\nfunction log(level, ...) end"
+            )
+        );
     }
 
     #[test]
     fn generates_variadic_only_param() {
         let api = LuaApi {
+            global_fields: vec![],
             global_functions: vec![LuaFunction {
                 name: "print".to_string(),
                 is_async: false,
@@ -1001,6 +1157,7 @@ function print_colored(msg, color) end
     #[test]
     fn generates_variadic_typed_param() {
         let api = LuaApi {
+            global_fields: vec![],
             global_functions: vec![LuaFunction {
                 name: "sum".to_string(),
                 is_async: false,
@@ -1022,6 +1179,7 @@ function print_colored(msg, color) end
     #[test]
     fn generates_optional_return() {
         let api = LuaApi {
+            global_fields: vec![],
             global_functions: vec![LuaFunction {
                 name: "find".to_string(),
                 is_async: false,
@@ -1041,6 +1199,7 @@ function print_colored(msg, color) end
     #[test]
     fn generates_map_param() {
         let api = LuaApi {
+            global_fields: vec![],
             global_functions: vec![LuaFunction {
                 name: "merge".to_string(),
                 is_async: false,
@@ -1060,6 +1219,7 @@ function print_colored(msg, color) end
     #[test]
     fn generates_array_of_class_return() {
         let api = LuaApi {
+            global_fields: vec![],
             global_functions: vec![LuaFunction {
                 name: "get_items".to_string(),
                 is_async: false,
@@ -1076,6 +1236,7 @@ function print_colored(msg, color) end
     #[test]
     fn generates_thread_return() {
         let api = LuaApi {
+            global_fields: vec![],
             global_functions: vec![LuaFunction {
                 name: "spawn".to_string(),
                 is_async: false,
@@ -1089,12 +1250,15 @@ function print_colored(msg, color) end
             ..Default::default()
         };
         let output = generate_stubs(&api);
-        assert!(output.contains("---@param func function\n---@return thread\nfunction spawn(func) end"));
+        assert!(
+            output.contains("---@param func function\n---@return thread\nfunction spawn(func) end")
+        );
     }
 
     #[test]
     fn generates_nil_return() {
         let api = LuaApi {
+            global_fields: vec![],
             global_functions: vec![LuaFunction {
                 name: "maybe".to_string(),
                 is_async: false,
@@ -1122,9 +1286,18 @@ function print_colored(msg, color) end
                     kind: MethodKind::Function,
                     is_async: false,
                     params: vec![
-                        LuaParam { name: "x".to_string(), ty: LuaType::Number },
-                        LuaParam { name: "y".to_string(), ty: LuaType::Number },
-                        LuaParam { name: "z".to_string(), ty: LuaType::Number },
+                        LuaParam {
+                            name: "x".to_string(),
+                            ty: LuaType::Number,
+                        },
+                        LuaParam {
+                            name: "y".to_string(),
+                            ty: LuaType::Number,
+                        },
+                        LuaParam {
+                            name: "z".to_string(),
+                            ty: LuaType::Number,
+                        },
                     ],
                     returns: vec![LuaType::Class("Vec3".to_string()).into()],
                     doc: None,
@@ -1231,6 +1404,7 @@ function print_colored(msg, color) end
                     doc: None,
                 }],
             }],
+            global_fields: vec![],
             global_functions: vec![LuaFunction {
                 name: "quit".to_string(),
                 is_async: false,
@@ -1257,10 +1431,7 @@ function print_colored(msg, color) end
                 doc: None,
                 fields: vec![LuaField {
                     name: "kind".to_string(),
-                    ty: LuaType::StringLiteral(vec![
-                        "click".to_string(),
-                        "hover".to_string(),
-                    ]),
+                    ty: LuaType::StringLiteral(vec!["click".to_string(), "hover".to_string()]),
                     writable: false,
                     doc: None,
                 }],
@@ -1308,7 +1479,9 @@ function print_colored(msg, color) end
             ..Default::default()
         };
         let output = generate_stubs(&api);
-        assert!(output.contains("--- Represents a player.\n---\n--- This is the main entity.\n---@class Player\n"));
+        assert!(output.contains(
+            "--- Represents a player.\n---\n--- This is the main entity.\n---@class Player\n"
+        ));
     }
 
     #[test]
@@ -1323,8 +1496,14 @@ function print_colored(msg, color) end
                     kind: MethodKind::Method,
                     is_async: false,
                     params: vec![
-                        LuaParam { name: "x".to_string(), ty: LuaType::Number },
-                        LuaParam { name: "y".to_string(), ty: LuaType::Number },
+                        LuaParam {
+                            name: "x".to_string(),
+                            ty: LuaType::Number,
+                        },
+                        LuaParam {
+                            name: "y".to_string(),
+                            ty: LuaType::Number,
+                        },
                     ],
                     returns: vec![],
                     doc: Some("Move the player to the given position.".to_string()),
@@ -1333,7 +1512,9 @@ function print_colored(msg, color) end
             ..Default::default()
         };
         let output = generate_stubs(&api);
-        assert!(output.contains("--- Move the player to the given position.\n---@param x number\n"));
+        assert!(
+            output.contains("--- Move the player to the given position.\n---@param x number\n")
+        );
     }
 
     #[test]
@@ -1368,6 +1549,7 @@ function print_colored(msg, color) end
     #[test]
     fn generates_global_function_doc() {
         let api = LuaApi {
+            global_fields: vec![],
             global_functions: vec![LuaFunction {
                 name: "greet".to_string(),
                 is_async: false,
@@ -1634,7 +1816,10 @@ function print_colored(msg, color) end
                         name: "f".to_string(),
                         kind: MethodKind::Method,
                         is_async: false,
-                        params: vec![LuaParam { name: "x".to_string(), ty: LuaType::Integer }],
+                        params: vec![LuaParam {
+                            name: "x".to_string(),
+                            ty: LuaType::Integer,
+                        }],
                         returns: vec![],
                         doc: None,
                     },
@@ -1666,7 +1851,10 @@ function print_colored(msg, color) end
                     name: "fetch".to_string(),
                     kind: MethodKind::Method,
                     is_async: true,
-                    params: vec![LuaParam { name: "url".to_string(), ty: LuaType::String }],
+                    params: vec![LuaParam {
+                        name: "url".to_string(),
+                        ty: LuaType::String,
+                    }],
                     returns: vec![LuaType::String.into()],
                     doc: Some("Fetch a URL.".to_string()),
                 }],
@@ -1695,7 +1883,8 @@ function print_colored(msg, color) end
             LuaType::Array(Box::new(LuaType::Map(
                 Box::new(LuaType::String),
                 Box::new(LuaType::Integer),
-            ))).to_string(),
+            )))
+            .to_string(),
             "(table<string, integer>)[]"
         );
     }
@@ -1734,7 +1923,10 @@ function print_colored(msg, color) end
             ..Default::default()
         };
         let output = generate_stubs(&api);
-        assert!(output.contains("function Obj[\"end\"]() end"), "got: {output}");
+        assert!(
+            output.contains("function Obj[\"end\"]() end"),
+            "got: {output}"
+        );
     }
 
     #[test]
@@ -1756,7 +1948,10 @@ function print_colored(msg, color) end
             ..Default::default()
         };
         let output = generate_stubs(&api);
-        assert!(output.contains("function Obj:update() end"), "got: {output}");
+        assert!(
+            output.contains("function Obj:update() end"),
+            "got: {output}"
+        );
     }
 
     #[test]
@@ -1777,6 +1972,9 @@ function print_colored(msg, color) end
             ..Default::default()
         };
         let output = generate_stubs(&api);
-        assert!(output.contains("function mymod[\"repeat\"]() end"), "got: {output}");
+        assert!(
+            output.contains("function mymod[\"repeat\"]() end"),
+            "got: {output}"
+        );
     }
 }

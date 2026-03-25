@@ -59,17 +59,24 @@ impl fmt::Display for LuaType {
             LuaType::Function => write!(f, "function"),
             LuaType::Any => write!(f, "any"),
             LuaType::Array(inner) => {
-                // Wrap complex inner types in parens to avoid ambiguity:
-                // (string?)[] not string?[] (which LuaLS reads as string[]?)
                 if matches!(inner.as_ref(), LuaType::Optional(_) | LuaType::Map(_, _)) {
                     write!(f, "({inner})[]")
                 } else {
                     write!(f, "{inner}[]")
                 }
             }
-            LuaType::Optional(inner) => write!(f, "{inner}?"),
+            LuaType::Optional(inner) => {
+                if matches!(
+                    inner.as_ref(),
+                    LuaType::Union(_) | LuaType::StringLiteral(_) | LuaType::FunctionSig { .. }
+                ) {
+                    write!(f, "({inner})?")
+                } else {
+                    write!(f, "{inner}?")
+                }
+            }
             LuaType::Map(k, v) => write!(f, "table<{k}, {v}>"),
-            LuaType::Class(name) => write!(f, "{name}"),
+            LuaType::Class(name) => write!(f, "{}", format_embedded_class_name(name)),
             LuaType::StringLiteral(variants) => {
                 for (i, v) in variants.iter().enumerate() {
                     if i > 0 {
@@ -114,15 +121,140 @@ impl fmt::Display for LuaType {
     }
 }
 
+fn format_embedded_class_name(name: &str) -> String {
+    parse_embedded_lua_type(name)
+        .map(|ty| ty.to_string())
+        .unwrap_or_else(|| name.to_string())
+}
+
+fn parse_embedded_lua_type(text: &str) -> Option<LuaType> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    if let Some(inner) = strip_wrapping_parens(text) {
+        return parse_embedded_lua_type(inner);
+    }
+
+    let union_parts = split_top_level(text, '|');
+    if union_parts.len() > 1 {
+        return Some(make_union(
+            union_parts
+                .into_iter()
+                .map(parse_embedded_lua_type_atom)
+                .collect(),
+        ));
+    }
+
+    if let Some(inner) = text.strip_suffix('?') {
+        return Some(LuaType::Optional(Box::new(parse_embedded_lua_type_atom(
+            inner.trim(),
+        ))));
+    }
+
+    if let Some(inner) = text.strip_suffix("[]") {
+        return Some(LuaType::Array(Box::new(parse_embedded_lua_type_atom(
+            inner.trim(),
+        ))));
+    }
+
+    if let Some(inner) = text.strip_suffix("...") {
+        return Some(LuaType::Variadic(Box::new(parse_embedded_lua_type_atom(
+            inner.trim(),
+        ))));
+    }
+
+    if let Some(inner) = text
+        .strip_prefix("table<")
+        .and_then(|inner| inner.strip_suffix('>'))
+    {
+        let parts = split_top_level(inner, ',');
+        if parts.len() == 2 {
+            return Some(LuaType::Map(
+                Box::new(parse_embedded_lua_type_atom(parts[0])),
+                Box::new(parse_embedded_lua_type_atom(parts[1])),
+            ));
+        }
+    }
+
+    None
+}
+
+fn parse_embedded_lua_type_atom(text: &str) -> LuaType {
+    parse_embedded_lua_type(text).unwrap_or_else(|| match text.trim() {
+        "nil" => LuaType::Nil,
+        "boolean" => LuaType::Boolean,
+        "integer" => LuaType::Integer,
+        "number" => LuaType::Number,
+        "string" => LuaType::String,
+        "table" => LuaType::Table,
+        "function" => LuaType::Function,
+        "any" => LuaType::Any,
+        "thread" => LuaType::Thread,
+        other => LuaType::Class(other.to_string()),
+    })
+}
+
+fn strip_wrapping_parens(text: &str) -> Option<&str> {
+    let inner = text.strip_prefix('(')?.strip_suffix(')')?;
+    let mut depth = 0usize;
+    for ch in inner.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    (depth == 0).then_some(inner.trim())
+}
+
+fn split_top_level(text: &str, separator: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut angle = 0usize;
+    let mut paren = 0usize;
+    let mut bracket = 0usize;
+
+    for (idx, ch) in text.char_indices() {
+        match ch {
+            '<' => angle += 1,
+            '>' => angle = angle.saturating_sub(1),
+            '(' => paren += 1,
+            ')' => paren = paren.saturating_sub(1),
+            '[' => bracket += 1,
+            ']' => bracket = bracket.saturating_sub(1),
+            _ => {}
+        }
+
+        if ch == separator && angle == 0 && paren == 0 && bracket == 0 {
+            parts.push(text[start..idx].trim());
+            start = idx + ch.len_utf8();
+        }
+    }
+
+    if start == 0 {
+        return vec![text.trim()];
+    }
+
+    parts.push(text[start..].trim());
+    parts
+}
+
 /// A parameter in a Lua method/function.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LuaParam {
     pub name: String,
     pub ty: LuaType,
 }
 
 /// A return value from a Lua method/function.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LuaReturn {
     pub ty: LuaType,
     pub name: Option<String>,
@@ -136,7 +268,10 @@ impl From<LuaType> for LuaReturn {
 
 impl LuaReturn {
     pub fn named(ty: LuaType, name: impl Into<String>) -> Self {
-        Self { ty, name: Some(name.into()) }
+        Self {
+            ty,
+            name: Some(name.into()),
+        }
     }
 }
 
@@ -207,9 +342,8 @@ pub struct LuaModule {
 }
 
 /// Build a union type from collected branch types.
-/// Deduplicates, collapses `T | nil` → `Optional(T)`, and simplifies single-element unions.
+/// Deduplicates, collapses `T | nil` -> `Optional(T)`, and simplifies single-element unions.
 pub fn make_union(types: Vec<LuaType>) -> LuaType {
-    // Flatten nested unions
     let mut flat: Vec<LuaType> = Vec::new();
     for ty in types {
         match ty {
@@ -222,7 +356,6 @@ pub fn make_union(types: Vec<LuaType>) -> LuaType {
         }
     }
 
-    // Deduplicate (preserving order)
     let mut seen = Vec::new();
     for ty in flat {
         if !seen.contains(&ty) {
@@ -230,13 +363,15 @@ pub fn make_union(types: Vec<LuaType>) -> LuaType {
         }
     }
 
-    // Remove Any — if we have concrete types, Any is just noise
-    let has_concrete = seen.iter().any(|t| !matches!(t, LuaType::Any | LuaType::Nil));
+    normalize_userdata_ref_union_items(&mut seen);
+
+    let has_concrete = seen
+        .iter()
+        .any(|t| !matches!(t, LuaType::Any | LuaType::Nil));
     if has_concrete {
         seen.retain(|t| !matches!(t, LuaType::Any));
     }
 
-    // Extract nil for optional handling
     let has_nil = seen.iter().any(|t| matches!(t, LuaType::Nil));
     if has_nil {
         seen.retain(|t| !matches!(t, LuaType::Nil));
@@ -257,11 +392,93 @@ pub fn make_union(types: Vec<LuaType>) -> LuaType {
     }
 }
 
+fn normalize_userdata_ref_union_items(types: &mut Vec<LuaType>) {
+    let has_generic_userdata_ref = types.iter().any(is_generic_userdata_ref_type);
+    if !has_generic_userdata_ref {
+        return;
+    }
+
+    for ty in types.iter_mut() {
+        if let LuaType::Class(name) = ty {
+            if matches!(name.as_str(), "UserDataRef" | "UserDataRefMut") {
+                continue;
+            }
+            for suffix in ["RefMut", "Ref"] {
+                if let Some(base) = name.strip_suffix(suffix)
+                    && !base.is_empty()
+                    && base
+                        .chars()
+                        .next()
+                        .is_some_and(|ch| ch.is_ascii_uppercase())
+                {
+                    *name = base.to_string();
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut deduped = Vec::new();
+    for ty in std::mem::take(types) {
+        if !deduped.contains(&ty) {
+            deduped.push(ty);
+        }
+    }
+
+    if deduped
+        .iter()
+        .any(|ty| !is_generic_userdata_ref_type(ty) && !matches!(ty, LuaType::Nil))
+    {
+        deduped.retain(|ty| !is_generic_userdata_ref_type(ty));
+    }
+
+    *types = deduped;
+}
+
+fn is_generic_userdata_ref_type(ty: &LuaType) -> bool {
+    matches!(ty, LuaType::Class(name) if matches!(name.as_str(), "UserDataRef" | "UserDataRefMut"))
+}
+
 /// The complete Lua API surface extracted from a crate.
 #[derive(Debug, Clone, Default)]
 pub struct LuaApi {
     pub classes: Vec<LuaClass>,
     pub enums: Vec<LuaEnum>,
     pub modules: Vec<LuaModule>,
+    pub global_fields: Vec<LuaField>,
     pub global_functions: Vec<LuaFunction>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn make_union_prefers_specific_userdata_ref_alias() {
+        assert_eq!(
+            make_union(vec![
+                LuaType::Class("UserDataRef".to_string()),
+                LuaType::Class("FileRef".to_string()),
+                LuaType::Integer,
+            ]),
+            LuaType::Union(vec![LuaType::Class("File".to_string()), LuaType::Integer])
+        );
+    }
+
+    #[test]
+    fn display_embedded_class_union_normalizes_userdata_refs() {
+        assert_eq!(
+            LuaType::Class("UserDataRef | FileRef | integer".to_string()).to_string(),
+            "File | integer"
+        );
+    }
+
+    #[test]
+    fn display_embedded_class_map_normalizes_userdata_refs() {
+        assert_eq!(
+            LuaType::Class("table<string, UserDataRef | FileRef | integer>".to_string())
+                .to_string(),
+            "table<string, File | integer>"
+        );
+    }
 }

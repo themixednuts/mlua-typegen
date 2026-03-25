@@ -6,7 +6,7 @@ use std::time::SystemTime;
 
 fn main() -> ExitCode {
     let mut output_dir = PathBuf::from("lua-types");
-    let mut emmylua = false;
+    let mut emit_emmylua = false;
     let mut cargo_args = Vec::new();
 
     let args: Vec<String> = env::args().skip(1).collect();
@@ -23,12 +23,18 @@ fn main() -> ExitCode {
                 }
             }
             "--emmylua" => {
-                emmylua = true;
+                emit_emmylua = true;
             }
             _ => {
                 cargo_args.push(arg.clone());
             }
         }
+    }
+
+    if output_dir.is_relative()
+        && let Ok(cwd) = env::current_dir()
+    {
+        output_dir = cwd.join(output_dir);
     }
 
     // If the output directory is missing, invalidate cargo's freshness check so
@@ -59,13 +65,20 @@ fn main() -> ExitCode {
     // Ensure the toolchain's shared libraries (rustc_driver, std) are findable.
     // The driver links against these DLLs and needs them on the library search path.
     if let Some(sysroot_lib) = find_sysroot_lib_dir() {
+        stage_driver_runtime(&driver, &sysroot_lib);
         prepend_lib_path(&mut cmd, &sysroot_lib);
     }
 
-    if emmylua {
+    if emit_emmylua {
         cmd.env("MLUA_TYPEGEN_EMMYLUA", "1");
     }
 
+    if let Ok(value) = env::var("MLUA_TYPEGEN_TRACE") {
+        cmd.env("MLUA_TYPEGEN_TRACE", value);
+    }
+    if let Ok(value) = env::var("MLUA_TYPEGEN_TRACE_FILE") {
+        cmd.env("MLUA_TYPEGEN_TRACE_FILE", value);
+    }
     let status = cmd.status();
 
     match status {
@@ -79,22 +92,28 @@ fn main() -> ExitCode {
 }
 
 fn find_driver() -> PathBuf {
-    // The driver binary should be next to this binary
     let self_path = env::current_exe().expect("failed to get current exe path");
     let dir = self_path.parent().expect("exe has no parent dir");
 
-    let driver = dir.join("mlua-typegen-driver");
-    if driver.exists() {
-        return driver;
+    let mut candidate_dirs = vec![dir.to_path_buf()];
+    if dir.file_name().and_then(|s| s.to_str()) == Some("deps")
+        && let Some(parent) = dir.parent()
+    {
+        candidate_dirs.push(parent.to_path_buf());
     }
 
-    // Try with .exe extension on Windows
-    let driver_exe = dir.join("mlua-typegen-driver.exe");
-    if driver_exe.exists() {
-        return driver_exe;
+    for dir in candidate_dirs {
+        let driver = dir.join("mlua-typegen-driver");
+        if driver.exists() {
+            return driver;
+        }
+
+        let driver_exe = dir.join("mlua-typegen-driver.exe");
+        if driver_exe.exists() {
+            return driver_exe;
+        }
     }
 
-    // Fall back to PATH
     PathBuf::from("mlua-typegen-driver")
 }
 
@@ -135,11 +154,11 @@ fn invalidate_source_mtime() {
     // Try common entry points in order of likelihood
     for name in ["src/lib.rs", "src/main.rs"] {
         let path = Path::new(name);
-        if path.exists() {
-            if let Ok(file) = fs::File::options().write(true).open(path) {
-                let _ = file.set_times(fs::FileTimes::new().set_modified(SystemTime::now()));
-                return;
-            }
+        if path.exists()
+            && let Ok(file) = fs::File::options().write(true).open(path)
+        {
+            let _ = file.set_times(fs::FileTimes::new().set_modified(SystemTime::now()));
+            return;
         }
     }
 }
@@ -160,5 +179,37 @@ fn prepend_lib_path(cmd: &mut Command, dir: &Path) {
         let current = env::var("LD_LIBRARY_PATH").unwrap_or_default();
         let new_path = format!("{}:{}", dir.display(), current);
         cmd.env("LD_LIBRARY_PATH", new_path);
+    }
+}
+
+fn stage_driver_runtime(driver: &Path, sysroot_lib: &Path) {
+    if !cfg!(windows) {
+        return;
+    }
+
+    let Some(driver_dir) = driver.parent() else {
+        return;
+    };
+
+    let Ok(entries) = fs::read_dir(sysroot_lib) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("dll") {
+            continue;
+        }
+
+        let dest = driver_dir.join(entry.file_name());
+        let should_copy = match (fs::metadata(&path), fs::metadata(&dest)) {
+            (Ok(src), Ok(dst)) => src.len() != dst.len(),
+            (Ok(_), Err(_)) => true,
+            _ => false,
+        };
+
+        if should_copy {
+            let _ = fs::copy(&path, &dest);
+        }
     }
 }

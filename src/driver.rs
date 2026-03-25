@@ -28,24 +28,75 @@ impl Callbacks for LuaTypegenCallbacks {
         _compiler: &interface::Compiler,
         tcx: TyCtxt<'_>,
     ) -> rustc_driver::Compilation {
+        let crate_name = tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE);
+        let crate_name = crate_name.as_str();
         let api = extract::collect_lua_api(tcx);
+
+        if std::env::var("MLUA_TYPEGEN_TRACE").is_ok() {
+            eprintln!("[mlua-typegen] driver crate={crate_name}");
+            for class in &api.classes {
+                let interesting: Vec<_> = class
+                    .methods
+                    .iter()
+                    .filter(|m| {
+                        matches!(
+                            m.name.as_str(),
+                            "open"
+                                | "history"
+                                | "ends_with"
+                                | "join"
+                                | "starts_with"
+                                | "strip_prefix"
+                                | "raw"
+                                | "__eq"
+                                | "__pairs"
+                        )
+                    })
+                    .map(|m| format!("{} params={:?} returns={:?}", m.name, m.params, m.returns))
+                    .collect();
+                if !interesting.is_empty()
+                    || matches!(
+                        class.name.as_str(),
+                        "Access" | "Path" | "Url" | "Style" | "File" | "Tab"
+                    )
+                {
+                    eprintln!(
+                        "[mlua-typegen] driver class={} fields={:?} methods={:?}",
+                        class.name, class.fields, interesting
+                    );
+                }
+            }
+            for func in &api.global_functions {
+                if matches!(func.name.as_str(), "Url" | "Path" | "File") {
+                    eprintln!(
+                        "[mlua-typegen] driver global_function={} params={:?} returns={:?}",
+                        func.name, func.params, func.returns
+                    );
+                }
+            }
+        }
 
         let total = api.classes.len()
             + api.enums.len()
             + api.modules.len()
+            + api.global_fields.len()
             + api.global_functions.len();
 
         if total > 0 {
-            let crate_name = tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE);
-            let crate_name = crate_name.as_str();
-            if let Err(e) = mlua_typegen::codegen::write_stubs_for(&self.output_dir, &api, self.target, crate_name) {
+            if let Err(e) = mlua_typegen::codegen::write_stubs_for(
+                &self.output_dir,
+                &api,
+                self.target,
+                crate_name,
+            ) {
                 eprintln!("mlua-typegen: failed to write stubs: {e}");
             } else {
                 eprintln!(
-                    "mlua-typegen: generated stubs ({} classes, {} enums, {} modules, {} globals) in {}/{}",
+                    "mlua-typegen: generated stubs ({} classes, {} enums, {} modules, {} global values, {} global functions) in {}/{}",
                     api.classes.len(),
                     api.enums.len(),
                     api.modules.len(),
+                    api.global_fields.len(),
                     api.global_functions.len(),
                     self.output_dir.display(),
                     crate_name,
@@ -79,17 +130,11 @@ fn main() -> std::process::ExitCode {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("lua-types"));
 
-        let target = if std::env::var("MLUA_TYPEGEN_EMMYLUA").is_ok() {
-            CodegenTarget::EmmyLua
-        } else {
-            CodegenTarget::LuaLS
-        };
+        let target = codegen_target(false);
 
         let mut callbacks = LuaTypegenCallbacks { output_dir, target };
 
-        let compiler_args: Vec<String> = std::iter::once(rustc)
-            .chain(rustc_args.iter().cloned())
-            .collect();
+        let compiler_args = make_compiler_args(rustc, rustc_args);
 
         return rustc_driver::catch_with_exit_code(|| {
             rustc_driver::run_compiler(&compiler_args, &mut callbacks)
@@ -98,24 +143,77 @@ fn main() -> std::process::ExitCode {
 
     // Direct invocation mode (not as wrapper)
     let output_dir = extract_flag(&mut args, "--mlua-typegen-output=");
-    let emmylua = extract_bool_flag(&mut args, "--mlua-typegen-emmylua");
+    let emit_emmylua = extract_bool_flag(&mut args, "--mlua-typegen-emmylua");
 
     let output_dir = output_dir
         .map(PathBuf::from)
         .or_else(|| std::env::var("MLUA_TYPEGEN_OUTPUT").ok().map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("lua-types"));
 
-    let target = if emmylua || std::env::var("MLUA_TYPEGEN_EMMYLUA").is_ok() {
+    let target = codegen_target(emit_emmylua);
+
+    let mut callbacks = LuaTypegenCallbacks { output_dir, target };
+    let compiler_args = if args.len() > 1 {
+        make_compiler_args(args[1].clone(), &args[2..])
+    } else {
+        vec!["rustc".to_string()]
+    };
+
+    rustc_driver::catch_with_exit_code(|| {
+        rustc_driver::run_compiler(&compiler_args, &mut callbacks)
+    })
+}
+
+fn make_compiler_args(rustc: String, rustc_args: &[String]) -> Vec<String> {
+    let mut compiler_args = Vec::with_capacity(rustc_args.len() + 3);
+    compiler_args.push(rustc.clone());
+    compiler_args.extend(rustc_args.iter().cloned());
+
+    let has_sysroot = rustc_args.iter().any(|arg| arg == "--sysroot")
+        || rustc_args.iter().any(|arg| arg.starts_with("--sysroot="));
+
+    if !has_sysroot && let Some(sysroot) = infer_sysroot_from_rustc(&rustc) {
+        compiler_args.push("--sysroot".to_string());
+        compiler_args.push(sysroot);
+    }
+
+    compiler_args
+}
+
+fn infer_sysroot_from_rustc(rustc: &str) -> Option<String> {
+    let rustc = std::path::Path::new(rustc);
+    if let (Some(bin), true) = (rustc.parent(), rustc.is_absolute())
+        && let Some(sysroot) = bin.parent()
+    {
+        return Some(sysroot.to_string_lossy().into_owned());
+    }
+
+    let mut cmd = if let Ok(toolchain) = std::env::var("RUSTUP_TOOLCHAIN") {
+        let mut cmd = std::process::Command::new("rustup");
+        cmd.args(["run", &toolchain, "rustc", "--print", "sysroot"]);
+        cmd
+    } else {
+        let mut cmd = std::process::Command::new(rustc);
+        cmd.args(["--print", "sysroot"]);
+        cmd
+    };
+
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let sysroot = String::from_utf8(output.stdout).ok()?;
+    let sysroot = sysroot.trim();
+    (!sysroot.is_empty()).then(|| sysroot.to_string())
+}
+
+fn codegen_target(force_emmylua: bool) -> CodegenTarget {
+    if force_emmylua || std::env::var("MLUA_TYPEGEN_EMMYLUA").is_ok() {
         CodegenTarget::EmmyLua
     } else {
         CodegenTarget::LuaLS
-    };
-
-    let mut callbacks = LuaTypegenCallbacks { output_dir, target };
-
-    rustc_driver::catch_with_exit_code(|| {
-        rustc_driver::run_compiler(&args[1..], &mut callbacks)
-    })
+    }
 }
 
 /// Extract a `--key=value` flag from args, removing it so rustc doesn't see it.
