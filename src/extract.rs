@@ -1001,10 +1001,14 @@ fn extract_enum_from_lua_impl(tcx: TyCtxt<'_>, impl_def_id: LocalDefId) -> Optio
     }
 
     let name = type_display_name(tcx, self_ty);
-    let variants: Vec<String> = adt_def
+    let pascal_variants: Vec<String> = adt_def
         .variants()
         .iter()
-        .map(|v| variant_to_lua_string(v.name.as_str()))
+        .map(|v| v.name.as_str().to_string())
+        .collect();
+    let variants: Vec<String> = pascal_variants
+        .iter()
+        .map(|v| variant_to_lua_string(v))
         .collect();
 
     if variants.is_empty() {
@@ -1017,6 +1021,7 @@ fn extract_enum_from_lua_impl(tcx: TyCtxt<'_>, impl_def_id: LocalDefId) -> Optio
         name,
         doc,
         variants,
+        pascal_variants,
     })
 }
 

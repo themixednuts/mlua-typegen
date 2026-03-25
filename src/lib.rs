@@ -318,7 +318,10 @@ pub struct LuaClass {
 pub struct LuaEnum {
     pub name: String,
     pub doc: Option<String>,
+    /// Snake_case variant names for the alias (e.g., "spawn_tab").
     pub variants: Vec<String>,
+    /// Original PascalCase variant names for enum constructor fields (e.g., "SpawnTab").
+    pub pascal_variants: Vec<String>,
 }
 
 /// A standalone function registered on a table or as a global.

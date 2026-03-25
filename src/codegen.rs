@@ -72,6 +72,16 @@ fn write_enum(out: &mut String, e: &LuaEnum, _target: CodegenTarget) {
         .collect::<Vec<_>>()
         .join(" | ");
     writeln!(out, "---@alias {} {variants}", e.name).unwrap();
+
+    // If we have PascalCase variants, emit an enum constructor class
+    // so that `Enum<T>.__index` resolves to real fields for autocomplete.
+    if !e.pascal_variants.is_empty() {
+        writeln!(out).unwrap();
+        writeln!(out, "---@class {}Actions", e.name).unwrap();
+        for variant in &e.pascal_variants {
+            writeln!(out, "---@field {variant} {} | EnumVariant", e.name).unwrap();
+        }
+    }
 }
 
 fn write_class(out: &mut String, class: &LuaClass, target: CodegenTarget) {
@@ -143,16 +153,22 @@ fn is_lua_ident(s: &str) -> bool {
 fn write_field(out: &mut String, field: &crate::LuaField) {
     let name = format_field_name(&field.name);
     let readonly = if field.writable { "" } else { " (readonly)" };
+    let ty = resolve_enum_constructor_type(&field.ty);
     if let Some(doc) = &field.doc {
         let first_line = doc.lines().next().unwrap_or("");
-        writeln!(
-            out,
-            "---@field {name} {}{} {first_line}",
-            field.ty, readonly
-        )
-        .unwrap();
+        writeln!(out, "---@field {name} {ty}{} {first_line}", readonly).unwrap();
     } else {
-        writeln!(out, "---@field {name} {}{}", field.ty, readonly).unwrap();
+        writeln!(out, "---@field {name} {ty}{}", readonly).unwrap();
+    }
+}
+
+/// If a type is `Enum<T>`, resolve it to `TActions` for enum constructor autocomplete.
+fn resolve_enum_constructor_type(ty: &LuaType) -> String {
+    let s = ty.to_string();
+    if let Some(inner) = s.strip_prefix("Enum<").and_then(|s| s.strip_suffix('>')) {
+        format!("{inner}Actions")
+    } else {
+        s
     }
 }
 
@@ -886,15 +902,21 @@ function Buffer.create(path) end
                     "warn".to_string(),
                     "error".to_string(),
                 ],
+                pascal_variants: vec![
+                    "Debug".to_string(),
+                    "Info".to_string(),
+                    "Warn".to_string(),
+                    "Error".to_string(),
+                ],
             }],
             ..Default::default()
         };
 
         let output = generate_stubs(&api);
-        assert_eq!(
-            output,
-            "---@meta\n\n---@alias LogLevel \"debug\" | \"info\" | \"warn\" | \"error\"\n"
-        );
+        assert!(output.contains("---@alias LogLevel \"debug\" | \"info\" | \"warn\" | \"error\""));
+        assert!(output.contains("---@class LogLevelActions"));
+        assert!(output.contains("---@field Debug LogLevel | EnumVariant"));
+        assert!(output.contains("---@field Error LogLevel | EnumVariant"));
     }
 
     #[test]
@@ -904,6 +926,7 @@ function Buffer.create(path) end
                 name: "OnlyOne".to_string(),
                 doc: None,
                 variants: vec!["sole".to_string()],
+                pascal_variants: vec!["Sole".to_string()],
             }],
             ..Default::default()
         };
@@ -1460,6 +1483,7 @@ function print_colored(msg, color) end
                 name: "Color".to_string(),
                 doc: None,
                 variants: vec!["red".to_string(), "green".to_string(), "blue".to_string()],
+                pascal_variants: vec!["Red".to_string(), "Green".to_string(), "Blue".to_string()],
             }],
             classes: vec![LuaClass {
                 name: "Canvas".to_string(),
@@ -1611,6 +1635,7 @@ function print_colored(msg, color) end
                 name: "Direction".to_string(),
                 doc: Some("Cardinal directions.".to_string()),
                 variants: vec!["north".to_string(), "south".to_string()],
+                pascal_variants: vec!["North".to_string(), "South".to_string()],
             }],
             ..Default::default()
         };
