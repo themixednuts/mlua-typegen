@@ -10,8 +10,8 @@ use rustc_span::Symbol;
 use heck::{ToSnakeCase, ToUpperCamelCase};
 use mlua_typegen::typemap::map_rust_type;
 use mlua_typegen::{
-    LuaApi, LuaClass, LuaEnum, LuaField, LuaFunction, LuaMethod, LuaModule, LuaParam, LuaReturn,
-    LuaType, MethodKind, make_union,
+    EventEmission, LuaApi, LuaClass, LuaEnum, LuaField, LuaFunction, LuaMethod, LuaModule,
+    LuaParam, LuaReturn, LuaType, MethodKind, make_union,
 };
 
 fn trace_enabled() -> bool {
@@ -484,6 +484,7 @@ fn collect_lua_api_from_item<'tcx>(tcx: TyCtxt<'tcx>, item: &hir::Item<'tcx>, ap
                 api.modules.push(module);
             }
             extract_registrations_from_fn(tcx, item, api);
+            extract_event_emissions_from_fn(tcx, item, api);
         }
         _ => {}
     }
@@ -1059,6 +1060,188 @@ fn extract_registrations_from_impl_item<'tcx>(
     };
     let body = tcx.hir_body(body_id);
     extract_registrations_from_body(tcx, body.value, api);
+}
+
+/// Scan a function body for event emission patterns like:
+/// `emit_event(&lua, ("event-name".to_string(), args))` or
+/// `emit_sync_callback(&lua, ("event-name", args))`
+/// where args come from `lua.pack_multi(typed_value)`.
+fn extract_event_emissions_from_fn<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    item: &hir::Item<'tcx>,
+    api: &mut LuaApi,
+) {
+    let hir::ItemKind::Fn { body, .. } = &item.kind else {
+        return;
+    };
+    let body = tcx.hir_body(*body);
+    extract_event_emissions_from_expr(tcx, body.value, api);
+}
+
+fn extract_event_emissions_from_expr<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+    api: &mut LuaApi,
+) {
+    match &expr.kind {
+        // Look for: some_fn(lua, (event_name, args)) where event_name is a string literal
+        hir::ExprKind::Call(callee, call_args) => {
+            // Check if any argument is a tuple containing (string_literal, pack_multi_result)
+            for arg in call_args.iter() {
+                if let hir::ExprKind::Tup(fields) = &arg.kind
+                    && fields.len() == 2
+                    && let Some(event_name) = extract_string_literal_from_expr(tcx, &fields[0])
+                    && !event_name.is_empty()
+                {
+                    let arg_types = extract_event_arg_types(tcx, &fields[1]);
+                    api.event_emissions.push(EventEmission {
+                        event_name,
+                        arg_types,
+                    });
+                }
+            }
+            // Recurse
+            extract_event_emissions_from_expr(tcx, callee, api);
+            for arg in call_args.iter() {
+                extract_event_emissions_from_expr(tcx, arg, api);
+            }
+        }
+        hir::ExprKind::MethodCall(_, receiver, args, _) => {
+            extract_event_emissions_from_expr(tcx, receiver, api);
+            for arg in args.iter() {
+                extract_event_emissions_from_expr(tcx, arg, api);
+            }
+        }
+        hir::ExprKind::Block(block, _) => {
+            for stmt in block.stmts {
+                match &stmt.kind {
+                    hir::StmtKind::Expr(e) | hir::StmtKind::Semi(e) => {
+                        extract_event_emissions_from_expr(tcx, e, api);
+                    }
+                    hir::StmtKind::Let(local) => {
+                        if let Some(init) = local.init {
+                            extract_event_emissions_from_expr(tcx, init, api);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(tail) = block.expr {
+                extract_event_emissions_from_expr(tcx, tail, api);
+            }
+        }
+        hir::ExprKind::Match(scrutinee, arms, _) => {
+            extract_event_emissions_from_expr(tcx, scrutinee, api);
+            for arm in *arms {
+                extract_event_emissions_from_expr(tcx, arm.body, api);
+            }
+        }
+        hir::ExprKind::If(cond, then_expr, else_expr) => {
+            extract_event_emissions_from_expr(tcx, cond, api);
+            extract_event_emissions_from_expr(tcx, then_expr, api);
+            if let Some(e) = else_expr {
+                extract_event_emissions_from_expr(tcx, e, api);
+            }
+        }
+        // Async fn bodies are closures wrapping coroutines
+        hir::ExprKind::Closure(closure) => {
+            let body = tcx.hir_body(closure.body);
+            extract_event_emissions_from_expr(tcx, body.value, api);
+        }
+        // Recurse through other common wrappers
+        hir::ExprKind::DropTemps(inner) | hir::ExprKind::AddrOf(_, _, inner) => {
+            extract_event_emissions_from_expr(tcx, inner, api);
+        }
+        _ => {}
+    }
+}
+
+/// Extract a string literal from an expression, handling `.to_string()` and `format!` patterns.
+fn extract_string_literal_from_expr(_tcx: TyCtxt<'_>, expr: &hir::Expr<'_>) -> Option<String> {
+    match &expr.kind {
+        hir::ExprKind::Lit(lit) => {
+            if let rustc_ast::LitKind::Str(sym, _) = &lit.node {
+                return Some(sym.as_str().to_string());
+            }
+            None
+        }
+        // "literal".to_string()
+        hir::ExprKind::MethodCall(segment, receiver, _, _) => {
+            if segment.ident.name.as_str() == "to_string" {
+                return extract_string_literal_from_expr(_tcx, receiver);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Extract event callback arg types from an expression.
+/// If the expression is the result of `pack_multi(value)`, extract value's type.
+/// Also resolves local variable bindings to find the pack_multi call.
+fn extract_event_arg_types<'tcx>(tcx: TyCtxt<'tcx>, expr: &'tcx hir::Expr<'tcx>) -> Vec<LuaType> {
+    // Direct pack_multi(value) call
+    if let Some(types) = extract_pack_multi_arg_types(tcx, expr) {
+        return types;
+    }
+
+    // If expr is a local variable reference, resolve to its initializer
+    if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = &expr.kind
+        && let rustc_hir::def::Res::Local(hir_id) = path.res
+    {
+        let node = tcx.hir_node(hir_id);
+        if let rustc_hir::Node::Pat(pat) = node {
+            // Walk up to find the enclosing LetStmt via the parent hierarchy
+            let parent_node = tcx.hir_node(tcx.parent_hir_id(pat.hir_id));
+            if let rustc_hir::Node::LetStmt(local) = parent_node
+                && let Some(init) = local.init
+            {
+                // The initializer might be pack_multi(value)?
+                let init = peel_try_expr(init);
+                if let Some(types) = extract_pack_multi_arg_types(tcx, init) {
+                    return types;
+                }
+            }
+        }
+    }
+
+    // Fallback: use typeck on the expression
+    let typeck = tcx.typeck(expr.hir_id.owner.def_id);
+    let ty = typeck.node_type(expr.hir_id);
+    let lua_ty = map_ty_to_lua(tcx, ty);
+    if matches!(lua_ty, LuaType::Any | LuaType::Nil) {
+        vec![]
+    } else {
+        vec![lua_ty]
+    }
+}
+
+/// Check if an expression is a `pack_multi(value)` call and extract the value's type.
+fn extract_pack_multi_arg_types<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &'tcx hir::Expr<'tcx>,
+) -> Option<Vec<LuaType>> {
+    let hir::ExprKind::MethodCall(segment, _receiver, args, _) = &expr.kind else {
+        return None;
+    };
+    if segment.ident.name.as_str() != "pack_multi" {
+        return None;
+    }
+    let value_expr = args.first()?;
+    let typeck = tcx.typeck(value_expr.hir_id.owner.def_id);
+    let ty = typeck.node_type(value_expr.hir_id);
+    Some(match ty.kind() {
+        ty::TyKind::Tuple(fields) if fields.is_empty() => vec![],
+        ty::TyKind::Tuple(fields) => fields.iter().map(|t| map_ty_to_lua(tcx, t)).collect(),
+        _ => {
+            let lua_ty = map_ty_to_lua(tcx, ty);
+            if lua_ty == LuaType::Nil {
+                vec![]
+            } else {
+                vec![lua_ty]
+            }
+        }
+    })
 }
 
 fn extract_registrations_from_body<'tcx>(

@@ -44,6 +44,10 @@ fn main() -> ExitCode {
         invalidate_source_mtime();
     }
 
+    // Clean stale event emissions from previous runs
+    let events_file = output_dir.join(".events.txt");
+    let _ = fs::remove_file(&events_file);
+
     // Find the driver binary (installed alongside this binary)
     let driver = find_driver();
 
@@ -82,7 +86,13 @@ fn main() -> ExitCode {
     let status = cmd.status();
 
     match status {
-        Ok(s) if s.success() => ExitCode::SUCCESS,
+        Ok(s) if s.success() => {
+            // After all crates are processed, generate the events type file
+            if let Err(e) = mlua_typegen::codegen::write_events_file(&output_dir) {
+                eprintln!("mlua-typegen: failed to write events file: {e}");
+            }
+            ExitCode::SUCCESS
+        }
         Ok(s) => ExitCode::from(s.code().unwrap_or(1) as u8),
         Err(e) => {
             eprintln!("error: failed to run cargo: {e}");

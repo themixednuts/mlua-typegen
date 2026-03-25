@@ -442,6 +442,14 @@ fn is_generic_userdata_ref_type(ty: &LuaType) -> bool {
     matches!(ty, LuaType::Class(name) if matches!(name.as_str(), "UserDataRef" | "UserDataRefMut"))
 }
 
+/// A discovered event emission: event name → callback argument types.
+/// Used to infer callback signatures for event registration functions like `wezterm.on`.
+#[derive(Debug, Clone)]
+pub struct EventEmission {
+    pub event_name: String,
+    pub arg_types: Vec<LuaType>,
+}
+
 /// The complete Lua API surface extracted from a crate.
 #[derive(Debug, Clone, Default)]
 pub struct LuaApi {
@@ -450,6 +458,8 @@ pub struct LuaApi {
     pub modules: Vec<LuaModule>,
     pub global_fields: Vec<LuaField>,
     pub global_functions: Vec<LuaFunction>,
+    /// Event emissions found in this crate (event_name → arg types).
+    pub event_emissions: Vec<EventEmission>,
 }
 
 #[cfg(test)]

@@ -104,6 +104,21 @@ impl Callbacks for LuaTypegenCallbacks {
             }
         }
 
+        // Write event emissions to shared file for cross-crate callback inference
+        if !api.event_emissions.is_empty() {
+            if let Err(e) = mlua_typegen::codegen::append_event_emissions(
+                &self.output_dir,
+                &api.event_emissions,
+            ) {
+                eprintln!("mlua-typegen: failed to write events: {e}");
+            } else {
+                eprintln!(
+                    "mlua-typegen: recorded {} event emissions from {crate_name}",
+                    api.event_emissions.len()
+                );
+            }
+        }
+
         rustc_driver::Compilation::Continue
     }
 }

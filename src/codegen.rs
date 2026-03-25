@@ -1,5 +1,6 @@
 use crate::{
-    CodegenTarget, LuaApi, LuaClass, LuaEnum, LuaFunction, LuaModule, LuaType, MethodKind,
+    CodegenTarget, EventEmission, LuaApi, LuaClass, LuaEnum, LuaFunction, LuaModule, LuaType,
+    MethodKind,
 };
 use std::fmt::Write;
 use std::path::Path;
@@ -532,6 +533,7 @@ pub fn write_stubs_for(
         modules: vec![], // modules handled above
         global_fields: api.global_fields.clone(),
         global_functions: api.global_functions.clone(),
+        event_emissions: vec![],
     };
 
     let non_module_content = generate_stubs_for(&non_module_api, target);
@@ -541,6 +543,102 @@ pub fn write_stubs_for(
         std::fs::write(output_dir.join(filename), non_module_content)?;
     }
 
+    Ok(())
+}
+
+const EVENTS_FILE: &str = ".events.txt";
+
+/// Append event emissions to a shared file for cross-crate accumulation.
+/// Format: one line per event: `event_name\ttype1\ttype2\t...`
+pub fn append_event_emissions(
+    output_dir: &Path,
+    emissions: &[EventEmission],
+) -> std::io::Result<()> {
+    use std::io::Write as IoWrite;
+    std::fs::create_dir_all(output_dir)?;
+    let events_path = output_dir.join(EVENTS_FILE);
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(events_path)?;
+    for emission in emissions {
+        let types: Vec<String> = emission.arg_types.iter().map(|t| t.to_string()).collect();
+        writeln!(file, "{}\t{}", emission.event_name, types.join("\t"))?;
+    }
+    Ok(())
+}
+
+/// Read accumulated event emissions from the shared file.
+/// Returns a map of event_name → Vec<arg_type_strings>.
+pub fn read_event_emissions(output_dir: &Path) -> Vec<(String, Vec<String>)> {
+    let events_path = output_dir.join(EVENTS_FILE);
+    let Ok(content) = std::fs::read_to_string(events_path) else {
+        return vec![];
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let mut events = vec![];
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\t').collect();
+        let event_name = parts[0].to_string();
+        if seen.contains(&event_name) {
+            continue;
+        }
+        seen.insert(event_name.clone());
+        let arg_types: Vec<String> = parts[1..]
+            .iter()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        events.push((event_name, arg_types));
+    }
+    events
+}
+
+/// Generate an events type annotation file with `---@alias` for each known event
+/// and typed callback signatures.
+pub fn write_events_file(output_dir: &Path) -> std::io::Result<()> {
+    let events = read_event_emissions(output_dir);
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    let mut out = String::new();
+    writeln!(out, "---@meta").unwrap();
+    writeln!(out).unwrap();
+
+    // Generate event name alias
+    let event_names: Vec<String> = events
+        .iter()
+        .map(|(name, _)| format!("\"{name}\""))
+        .collect();
+    writeln!(out, "---@alias EventName {}", event_names.join(" | ")).unwrap();
+    writeln!(out).unwrap();
+
+    // Generate per-event callback type aliases
+    for (event_name, arg_types) in &events {
+        let safe_name: String = event_name
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '_' })
+            .collect();
+        let params = if arg_types.is_empty() {
+            String::new()
+        } else {
+            arg_types
+                .iter()
+                .enumerate()
+                .map(|(i, ty)| format!("p{}: {ty}", i + 1))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        writeln!(out, "---@alias EventCallback_{safe_name} fun({params})").unwrap();
+    }
+
+    std::fs::write(output_dir.join("_events.lua"), out)?;
     Ok(())
 }
 
@@ -1523,6 +1621,7 @@ function print_colored(msg, color) end
                 returns: vec![],
                 doc: None,
             }],
+            event_emissions: vec![],
         };
         let output = generate_stubs(&api);
         let alias_pos = output.find("---@alias Color").unwrap();
