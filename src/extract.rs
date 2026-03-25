@@ -5858,6 +5858,8 @@ fn lua_type_from_extracted_name(name: &str) -> LuaType {
         "Function" | "LuaFunction" => LuaType::Function,
         "AnyUserData" | "LuaAnyUserData" => LuaType::Any,
         "Thread" | "LuaThread" => LuaType::Thread,
+        "Lua" => LuaType::Any,
+        "Error" | "LuaError" => LuaType::Nil,
         "()" => LuaType::Nil,
         _ => LuaType::Class(qualified_name.to_string()),
     }

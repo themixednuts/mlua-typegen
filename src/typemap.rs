@@ -230,6 +230,9 @@ pub fn map_rust_type(rust_type: &str, type_args: &[LuaType]) -> LuaType {
             LuaType::Any
         }
 
+        // The Lua runtime context itself — not a meaningful Lua type
+        "mlua::lua::Lua" | "mlua::Lua" | "mlua::prelude::Lua" => LuaType::Any,
+
         "mlua::userdata::UserDataRef"
         | "mlua::UserDataRef"
         | "mlua::prelude::LuaUserDataRef"
@@ -426,7 +429,7 @@ fn heuristic_type_match(rust_type: &str, type_args: &[LuaType]) -> LuaType {
         "Function" | "LuaFunction" if type_args.is_empty() => return LuaType::Function,
         "Thread" | "LuaThread" => return LuaType::Thread,
         "Error" | "LuaError" => return LuaType::String,
-        "AnyUserData" | "LuaAnyUserData" => return LuaType::Any,
+        "AnyUserData" | "LuaAnyUserData" | "Lua" => return LuaType::Any,
         _ => {}
     }
 
