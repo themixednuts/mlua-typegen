@@ -12,7 +12,7 @@ fn main() {
     let rustc = rustc_info();
     ensure_nightly(&rustc);
     ensure_supported_nightly(&rustc);
-    ensure_rustc_dev(&rustc);
+    ensure_rustc_components(&rustc);
     stage_windows_rustc_runtime(&rustc);
     emit_rustc_api_cfgs(&rustc);
 
@@ -144,33 +144,42 @@ fn ensure_supported_nightly(rustc: &RustcInfo) {
     );
 }
 
-fn ensure_rustc_dev(rustc: &RustcInfo) {
-    if has_rustc_dev(rustc) {
+fn ensure_rustc_components(rustc: &RustcInfo) {
+    let mut missing = Vec::new();
+    if !has_rustc_dev(rustc) {
+        missing.push("rustc-dev");
+    }
+    if cfg!(unix) && !has_rustc_llvm_runtime(rustc) {
+        missing.push("llvm-tools-preview");
+    }
+
+    if missing.is_empty() {
         return;
     }
 
     println!(
-        "cargo:warning=mlua-typegen: rustc-dev is missing for {}; installing it with rustup",
-        rustc.toolchain
+        "cargo:warning=mlua-typegen: missing {} for {}; installing with rustup",
+        missing.join(", "),
+        rustc.toolchain,
     );
 
     let status = Command::new("rustup")
-        .args([
-            "component",
-            "add",
-            "rustc-dev",
-            "--toolchain",
-            &rustc.toolchain,
-        ])
+        .args(["component", "add"])
+        .args(&missing)
+        .args(["--toolchain", &rustc.toolchain])
         .status();
 
-    if matches!(status, Ok(status) if status.success()) && has_rustc_dev(rustc) {
+    if matches!(status, Ok(status) if status.success())
+        && has_rustc_dev(rustc)
+        && (!cfg!(unix) || has_rustc_llvm_runtime(rustc))
+    {
         return;
     }
 
     panic!(
-        "mlua-typegen needs the rustc-dev component for toolchain `{}`. \
-         Automatic installation failed; run `rustup component add rustc-dev --toolchain {}`.",
+        "mlua-typegen needs rustc-dev and, on Unix, llvm-tools-preview for toolchain `{}`. \
+         Automatic installation failed; run `rustup component add rustc-dev \
+         llvm-tools-preview --toolchain {}`.",
         rustc.toolchain, rustc.toolchain
     );
 }
@@ -278,6 +287,20 @@ fn has_rustc_dev(rustc: &RustcInfo) -> bool {
             .file_name()
             .to_str()
             .is_some_and(|name| name.contains("rustc_driver"))
+    })
+}
+
+fn has_rustc_llvm_runtime(rustc: &RustcInfo) -> bool {
+    let lib_dir = rustc_dev_lib_dir(&rustc.sysroot, &rustc.host);
+    let Ok(entries) = std::fs::read_dir(lib_dir) else {
+        return false;
+    };
+
+    entries.flatten().any(|entry| {
+        entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with("libLLVM-") && name.contains("-rust-"))
     })
 }
 

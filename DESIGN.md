@@ -229,7 +229,7 @@ cargo mlua-typegen --output lua/types/
 cargo mlua-typegen -p my-plugin-crate --output lua/types/
 ```
 
-The `rust-toolchain.toml` and build script handle `rustc-dev`; users should not need a separate component setup step.
+The `rust-toolchain.toml` and build script handle `rustc-dev` plus the Unix LLVM runtime; users should not need a separate component setup step.
 
 The generated `lua/types/mlua-typegen.lua` snapshot lives in a directory that can
 be added to your LSP's library paths:
@@ -252,7 +252,7 @@ be added to your LSP's library paths:
 
 ## Build Requirements
 
-- **Tool build**: requires nightly (`rustc_private` feature); `rustc-dev` is installed automatically when missing
+- **Tool build**: requires nightly (`rustc_private` feature); `rustc-dev` and the Unix LLVM runtime are installed automatically when missing
 - **User projects**: no requirements — works on stable Rust, zero code changes needed
 - **Rust version**: requires Rust 1.98 and pins `nightly-2026-06-30`; newer nightlies are best-effort and older compilers fail fast in `build.rs`
 

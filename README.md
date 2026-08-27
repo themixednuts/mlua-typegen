@@ -60,7 +60,7 @@ The supported toolchain is `nightly-2026-06-30` (`rustc 1.98.0-nightly`). The re
 cargo +nightly-2026-06-30 install --git https://github.com/themixednuts/mlua-typegen
 ```
 
-No separate `rustc-dev` setup is required. The repository declares the component in `rust-toolchain.toml`, and the build script installs it with rustup if it is missing.
+No separate component setup is required. The repository declares `rustc-dev` and the Unix LLVM runtime in `rust-toolchain.toml`, and the build script installs either with rustup if it is missing.
 
 ## Usage
 
