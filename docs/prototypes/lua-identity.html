@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Lua identity decision lab — prototype</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b1020; --panel:#141c31; --line:#2a3655; --ink:#eef3ff; --muted:#9eaccb; --accent:#5eead4; --bad:#fb7185; --warn:#fbbf24; --good:#86efac; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:linear-gradient(145deg,#08101e,#11182b 55%,#0b1020); color:var(--ink); font:15px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; }
+    main { width:min(1180px,calc(100% - 32px)); margin:0 auto; padding:42px 0 64px; }
+    h1,h2,h3,p { margin-top:0; } h1 { font-size:clamp(30px,5vw,52px); line-height:1.05; letter-spacing:-.04em; max-width:850px; }
+    h2 { font-size:20px; } h3 { font-size:15px; color:var(--accent); }
+    .lede { max-width:850px; color:var(--muted); font-size:17px; }
+    .badge { display:inline-block; padding:4px 9px; border:1px solid var(--warn); color:var(--warn); border-radius:999px; font-size:12px; letter-spacing:.08em; text-transform:uppercase; }
+    .grid { display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin:24px 0; }
+    .card,.state,.walkthrough { background:rgba(20,28,49,.9); border:1px solid var(--line); border-radius:14px; padding:18px; box-shadow:0 14px 38px rgba(0,0,0,.18); }
+    .card.selected { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); }
+    button { border:1px solid var(--line); background:#19243d; color:var(--ink); border-radius:9px; padding:9px 12px; cursor:pointer; font:inherit; }
+    button:hover,button.active { border-color:var(--accent); color:var(--accent); }
+    button.primary { background:var(--accent); color:#06201c; border-color:var(--accent); font-weight:700; }
+    .controls,.tabs,.steps { display:flex; flex-wrap:wrap; gap:8px; }
+    .controls { margin:15px 0 24px; }
+    .state { margin:24px 0; }
+    .summary { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:10px; margin-bottom:16px; }
+    .metric { background:#0e1629; border-radius:10px; padding:12px; } .metric b { display:block; font-size:22px; }
+    table { width:100%; border-collapse:collapse; font-size:13px; } th,td { text-align:left; vertical-align:top; padding:10px 8px; border-top:1px solid var(--line); }
+    th { color:var(--muted); font-weight:600; } code { color:#c4b5fd; overflow-wrap:anywhere; }
+    .ok { color:var(--good); } .bad { color:var(--bad); } .warn { color:var(--warn); }
+    .tabs { margin-bottom:14px; } .walkthrough p { color:var(--muted); }
+    .step-done { opacity:.45; text-decoration:line-through; }
+    .verdict { margin-top:24px; border-left:4px solid var(--accent); padding-left:16px; }
+    @media (max-width:850px) { .grid { grid-template-columns:1fr; } .summary { grid-template-columns:repeat(2,1fr); } table { display:block; overflow:auto; } }
+  </style>
+</head>
+<body>
+<main>
+  <span class="badge">Throwaway decision prototype</span>
+  <h1>What is a Lua-visible name when the name is awkward?</h1>
+  <p class="lede">This lab compares three identity models across aliases, nested tables, punctuation, collisions, byte strings, and path-traversal names. The question is whether one canonical segmented identity—separate from annotation spelling and files—matches the runtime semantics without making generated output unsafe.</p>
+
+  <section class="grid" id="strategies"></section>
+
+  <h2>Free play</h2>
+  <div class="controls" id="cases"></div>
+  <button id="reset">Reset registrations</button>
+
+  <section class="state">
+    <h2>Resolved state</h2>
+    <div class="summary" id="summary"></div>
+    <table>
+      <thead><tr><th>Runtime path</th><th>Canonical key</th><th>Lua access</th><th>Annotation id</th><th>Report file</th><th>Outcome</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </section>
+
+  <section class="walkthrough">
+    <h2>Guided walkthroughs</h2>
+    <div class="tabs" id="tabs"></div>
+    <div id="guide"></div>
+  </section>
+
+  <section class="verdict">
+    <h2>Recommendation to react to</h2>
+    <p>Choose <strong>canonical path segments</strong>. Store exact Lua string bytes per segment, derive a reversible internal annotation id, render bracket access with a byte-safe Lua literal, and write every compiler unit to one fixed report filename. Reopening a module may merge compatible members; incompatible contributions at one canonical path are a typed collision. One Rust type registered at two paths is two valid Lua identities.</p>
+  </section>
+</main>
+<script>
+const IdentityLab = (() => {
+  const keywords = new Set('and break do else elseif end false for function goto if in local nil not or repeat return then true until while'.split(' '));
+  const utf8 = new TextEncoder();
+  const bytes = value => value.bytes ?? [...utf8.encode(value.text)];
+  const hex = values => values.map(value => value.toString(16).padStart(2,'0')).join('');
+  const text = segment => segment.text ?? `<bytes:${hex(bytes(segment))}>`;
+  const rawPath = path => path.map(text).join('.');
+  const luaString = segment => '"' + bytes(segment).map(value => {
+    if (value === 34) return '\\"';
+    if (value === 92) return '\\\\';
+    if (value >= 32 && value <= 126) return String.fromCharCode(value);
+    return `\\${String(value).padStart(3,'0')}`;
+  }).join('') + '"';
+  const canonicalKey = path => 'g' + path.map(segment => `:${bytes(segment).length}:${hex(bytes(segment))}`).join('');
+  const annotationId = path => '__mlua_g' + path.map(segment => `_${bytes(segment).length}_${hex(bytes(segment))}`).join('');
+  const safeIdent = value => /^[A-Za-z_][A-Za-z0-9_]*$/.test(value) && !keywords.has(value);
+  const bracketAccess = path => '_G' + path.map(segment => `[${luaString(segment)}]`).join('');
+
+  const strategies = {
+    raw: {
+      title:'Raw names everywhere',
+      summary:'Join segments with dots and reuse that text as symbol and filename.',
+      resolve(path) { const joined=rawPath(path); return { key:joined, access:joined, symbol:joined, file:`${joined}.lua` }; }
+    },
+    slug: {
+      title:'Sanitize to identifiers',
+      summary:'Replace punctuation and keywords with readable identifier text.',
+      resolve(path) { const slug=path.map(segment => { const value=text(segment).replace(/[^A-Za-z0-9_]/g,'_'); return safeIdent(value)?value:`_${value}`; }).join('__'); return { key:slug, access:slug, symbol:slug, file:`${slug}.lua` }; }
+    },
+    canonical: {
+      title:'Canonical path segments',
+      summary:'Keep exact bytes as identity; derive renderer and storage projections.',
+      resolve(path) { return { key:canonicalKey(path), access:bracketAccess(path), symbol:annotationId(path), file:'annotations.lua' }; }
+    }
+  };
+
+  function resolve(strategy, registrations) {
+    const seen = new Map();
+    return registrations.map(registration => {
+      const projection = strategies[strategy].resolve(registration.path);
+      const prior = seen.get(projection.key);
+      let outcome = 'accepted';
+      if (prior) outcome = prior.shape === registration.shape && registration.kind === 'module' && prior.kind === 'module' ? 'compatible module reopen' : 'collision';
+      else seen.set(projection.key, registration);
+      const escaped = projection.access.startsWith('_G[') || projection.access.split('.').every(safeIdent);
+      const contained = projection.file === 'annotations.lua' || (!projection.file.includes('..') && !/[\\/]/.test(projection.file));
+      return { ...registration, ...projection, outcome, escaped, contained };
+    });
+  }
+  return { strategies, resolve, rawPath };
+})();
+
+const segment = text => ({text});
+const cases = {
+  normal:{label:'Normal global', regs:[{path:[segment('wezterm')],kind:'module',shape:'table'}]},
+  keyword:{label:'Keyword', regs:[{path:[segment('end')],kind:'function',shape:'fun()'}]},
+  punctuation:{label:'Punctuation', regs:[{path:[segment('foo-bar')],kind:'field',shape:'integer'}]},
+  dots:{label:'Dot ambiguity', regs:[{path:[segment('a.b')],kind:'module',shape:'table'},{path:[segment('a'),segment('b')],kind:'module',shape:'table'}]},
+  nested:{label:'Nested odd key', regs:[{path:[segment('wezterm'),segment('gui-kit')],kind:'module',shape:'table'}]},
+  alias:{label:'Two aliases', regs:[{path:[segment('old_name')],kind:'class',shape:'RustType#4'},{path:[segment('new_name')],kind:'class',shape:'RustType#4'}]},
+  slugCollision:{label:'Sanitizer collision', regs:[{path:[segment('foo-bar')],kind:'function',shape:'fun(integer)'},{path:[segment('foo_bar')],kind:'function',shape:'fun(string)'}]},
+  reopen:{label:'Module reopen', regs:[{path:[segment('api')],kind:'module',shape:'table'},{path:[segment('api')],kind:'module',shape:'table'}]},
+  conflict:{label:'Runtime collision', regs:[{path:[segment('api'),segment('run')],kind:'function',shape:'fun(integer)'},{path:[segment('api'),segment('run')],kind:'field',shape:'string'}]},
+  traversal:{label:'Traversal text', regs:[{path:[segment('../../outside')],kind:'module',shape:'table'}]},
+  bytes:{label:'Non-text bytes', regs:[{path:[{bytes:[0,255,34,92]}],kind:'field',shape:'string'}]}
+};
+const guides = [
+  {name:'Names ≠ paths',desc:'A literal dot in one Lua key must not collapse into two table lookups.',steps:['dots','nested']},
+  {name:'Safe output',desc:'Runtime names may resemble paths, but report storage must remain fixed and contained.',steps:['traversal','bytes']},
+  {name:'Collisions',desc:'Aliases are distinct; module reopening is compositional; incompatible writes conflict.',steps:['alias','reopen','conflict']},
+  {name:'Escaping',desc:'Keywords and punctuation remain the exact runtime names while generated Lua stays parseable.',steps:['keyword','punctuation','slugCollision']}
+];
+let state={strategy:'canonical',registrations:[],guide:0,step:0};
+function addCase(key){ state.registrations.push(...cases[key].regs); state.step++; render(); }
+function reset(){ state.registrations=[]; state.step=0; render(); }
+function render(){
+  document.querySelectorAll('[data-strategy]').forEach(node=>node.classList.toggle('selected',node.dataset.strategy===state.strategy));
+  const rows=IdentityLab.resolve(state.strategy,state.registrations);
+  const collisions=rows.filter(row=>row.outcome==='collision').length;
+  const unsafe=rows.filter(row=>!row.contained||!row.escaped).length;
+  document.querySelector('#summary').innerHTML=`<div class="metric"><span>Registrations</span><b>${rows.length}</b></div><div class="metric"><span>Distinct identities</span><b>${new Set(rows.map(r=>r.key)).size}</b></div><div class="metric"><span>Collisions</span><b class="${collisions?'bad':'ok'}">${collisions}</b></div><div class="metric"><span>Unsafe projections</span><b class="${unsafe?'bad':'ok'}">${unsafe}</b></div>`;
+  document.querySelector('#rows').innerHTML=rows.map(row=>`<tr><td><code>${escapeHtml(IdentityLab.rawPath(row.path))}</code></td><td><code>${escapeHtml(row.key)}</code></td><td><code>${escapeHtml(row.access)}</code></td><td><code>${escapeHtml(row.symbol)}</code></td><td class="${row.contained?'ok':'bad'}"><code>${escapeHtml(row.file)}</code></td><td class="${row.outcome==='collision'?'bad':row.outcome.includes('reopen')?'warn':'ok'}">${row.outcome}${row.escaped?'':' · invalid Lua'}${row.contained?'':' · escapes report root'}</td></tr>`).join('');
+  renderGuide();
+}
+function escapeHtml(value){return String(value).replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));}
+function renderGuide(){ const guide=guides[state.guide]; document.querySelector('#guide').innerHTML=`<h3>${guide.name}</h3><p>${guide.desc}</p><div class="steps">${guide.steps.map((key,index)=>`<button class="${index<state.step?'step-done':index===state.step?'active':''}" data-step="${key}" ${index!==state.step?'disabled':''}>${index+1}. ${cases[key].label}</button>`).join('')}</div>`; document.querySelectorAll('[data-step]').forEach(button=>button.onclick=()=>addCase(button.dataset.step)); }
+document.querySelector('#strategies').innerHTML=Object.entries(IdentityLab.strategies).map(([key,value])=>`<article class="card" data-strategy="${key}"><h3>${value.title}</h3><p>${value.summary}</p><button>Select</button></article>`).join('');
+document.querySelectorAll('[data-strategy] button').forEach(button=>button.onclick=()=>{state.strategy=button.closest('[data-strategy]').dataset.strategy;render();});
+document.querySelector('#cases').innerHTML=Object.entries(cases).map(([key,value])=>`<button data-case="${key}">${value.label}</button>`).join('');
+document.querySelectorAll('[data-case]').forEach(button=>button.onclick=()=>addCase(button.dataset.case));
+document.querySelector('#tabs').innerHTML=guides.map((guide,index)=>`<button data-guide="${index}">${guide.name}</button>`).join('');
+document.querySelectorAll('[data-guide]').forEach(button=>button.onclick=()=>{state.guide=Number(button.dataset.guide);reset();});
+document.querySelector('#reset').onclick=reset;
+render();
+</script>
+</body>
+</html>
