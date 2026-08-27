@@ -1,5 +1,9 @@
 version: 2
 updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
   - package-ecosystem: cargo
     directory: /
     schedule:
@@ -8,15 +12,36 @@ updates:
     directory: /tests/fixtures/mlua/0.9-latest
     schedule:
       interval: weekly
+    ignore:
+      # Compatibility lanes may advance within their release series only.
+      - dependency-name: mlua
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-major
   - package-ecosystem: cargo
     directory: /tests/fixtures/mlua/0.10-latest
     schedule:
       interval: weekly
+    ignore:
+      - dependency-name: mlua
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-major
   - package-ecosystem: cargo
     directory: /tests/fixtures/mlua/0.11-latest
     schedule:
       interval: weekly
+    ignore:
+      - dependency-name: mlua
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-major
   - package-ecosystem: cargo
     directory: /tests/fixtures/mlua/0.12-min-latest
     schedule:
       interval: weekly
+    ignore:
+      - dependency-name: mlua
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-major
