@@ -1,0 +1,13 @@
+[package]
+name = "mlua-compat-011-pre-once"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "../sources/v10.rs"
+
+[dependencies]
+mlua = { version = ">=0.11.0, <0.12.0", features = ["lua54", "async", "module", "macros"] }
+
+[workspace]

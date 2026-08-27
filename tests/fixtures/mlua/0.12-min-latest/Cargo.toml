@@ -1,0 +1,13 @@
+[package]
+name = "mlua-compat-012-min-latest"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "../sources/v12.rs"
+
+[dependencies]
+mlua = { version = ">=0.12.0, <0.13.0", features = ["lua54", "async", "module", "macros"] }
+
+[workspace]

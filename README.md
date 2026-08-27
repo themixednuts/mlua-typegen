@@ -35,7 +35,7 @@ It generates:
 ```lua
 ---@meta
 
----@class Vec2
+---@class (exact) Vec2
 ---@field x number (readonly)
 ---@field y number (readonly)
 local Vec2 = {}
@@ -43,31 +43,29 @@ local Vec2 = {}
 ---@param other_x number
 ---@param other_y number
 ---@return number
-function Vec2:dot(other_x, other_y) end
+Vec2["dot"] = function(self, other_x, other_y) end
 
 ---@return number x
 ---@return number y
-function Vec2:components() end
+Vec2["components"] = function(self) end
 ```
 
 ## Install
 
-Requires a nightly toolchain with `rustc-dev` (the driver links against rustc internals). Your project can use stable Rust — the tool auto-selects nightly at runtime.
+Requires Rust 1.98 on a rustup-managed nightly because the driver links against rustc internals. Your project can still be stable Rust; `mlua-typegen` uses its own pinned nightly toolchain when it runs.
+
+The supported toolchain is `nightly-2026-06-30` (`rustc 1.98.0-nightly`). The repository pins this version so rustc-private API changes in later nightlies cannot break builds without warning.
 
 ```bash
-cargo +nightly install --git https://github.com/themixednuts/mlua-typegen
+cargo +nightly-2026-06-30 install --git https://github.com/themixednuts/mlua-typegen
 ```
 
-Make sure the nightly `rustc-dev` component is installed:
-
-```bash
-rustup component add rustc-dev --toolchain nightly
-```
+No separate `rustc-dev` setup is required. The repository declares the component in `rust-toolchain.toml`, and the build script installs it with rustup if it is missing.
 
 ## Usage
 
 ```bash
-# Generate stubs (defaults to ./lua-types/)
+# Generate ./lua-types/mlua-typegen.lua
 mlua-typegen
 
 # Specify output directory
@@ -78,7 +76,15 @@ mlua-typegen -p my-plugin-crate
 
 # Generate EmmyLua-flavored annotations
 mlua-typegen --emmylua
+
+# Use a non-default workspace mapping file
+mlua-typegen --config config/mlua-typegen.toml
 ```
+
+Each successful run publishes one complete `mlua-typegen.lua` snapshot. Compiler
+processes write only to private per-run report directories; a failed build leaves
+the previous public snapshot unchanged. If upgrading from the former multi-file
+layout, remove the old generated output directory once before regenerating.
 
 Then point your language server at the output:
 
@@ -114,7 +120,42 @@ Then point your language server at the output:
 - **`AnyUserData` resolution** — traces through `create_any_userdata(expr)` to resolve the concrete class
 - **`into_lua_multi` decomposition** — expands tuple returns into multiple `@return` annotations
 
-## Type mapping
+## Explicit type mappings
+
+Place `mlua-typegen.toml` at the Cargo workspace root, or select exactly one
+file with `--config PATH`. Start the file with Tombi's schema directive so the
+editor validates the generated contract directly:
+
+```toml
+#:schema https://raw.githubusercontent.com/themixednuts/mlua-typegen/main/schemas/mlua-typegen.schema.json
+
+[[mappings]]
+id = "uuid"
+rust = { package = "uuid", version = "1", path = "Uuid" }
+lua = "string"
+
+[[mappings]]
+id = "wire-id"
+rust = { package = "domain", path = "WireId" }
+from_lua = "string"
+into_lua = "integer"
+
+[[external_types]]
+name = "Promise"
+params = ["T"]
+```
+
+`lua` asserts the same `FromLua` and `IntoLua` type. Directional fields may be
+declared separately. Expressions support unions, optionals, arrays, maps,
+functions, named types, and declared Rust parameters such as `$T`. A genuinely
+runtime-erased value must use `dynamic("reason")`; bare `any` is invalid.
+
+The schema is generated from the Rust configuration types with
+`cargo run --example generate-config-schema`. Its URL remains stable; the
+project does not use or pre-bump numeric schema versions. See the
+[explicit type-mapping decision](docs/decisions/explicit-type-mappings.md).
+
+## Native type mapping
 
 | Rust | Lua |
 |------|-----|
@@ -122,20 +163,21 @@ Then point your language server at the output:
 | `i8`..`i128`, `u8`..`u128`, `usize`, `isize` | `integer` |
 | `f32`, `f64` | `number` |
 | `bool` | `boolean` |
-| `Vec<T>`, `VecDeque<T>`, `SmallVec<T>` | `T[]` |
+| `Vec<T>`, `VecDeque<T>` | `T[]` |
 | `Option<T>` | `T?` |
-| `HashMap<K, V>`, `BTreeMap<K, V>`, `IndexMap<K, V>` | `table<K, V>` |
+| `HashMap<K, V>`, `BTreeMap<K, V>` | `table<K, V>` |
 | `Result<T, _>` | `T` (unwrapped) |
 | `Box<T>`, `Arc<T>`, `Rc<T>`, `Mutex<T>`, `RwLock<T>` | `T` (unwrapped) |
 | `mlua::Table` | `table` |
 | `mlua::Function` | `function` |
 | `mlua::Thread` | `thread` |
-| `mlua::Value` | `any` |
+| `mlua::Value` | `any` with native dynamic evidence |
 | `mlua::Error` | `string` |
-| `mlua::AnyUserData` | resolved class or `any` |
-| `serde_json::Value` | `any` |
-| `uuid::Uuid`, `url::Url` | `string` |
-| Other `UserData` types | class reference by name |
+| `mlua::AnyUserData` | resolved registered userdata identity |
+
+External crate semantics such as `uuid::Uuid` are not guessed from names or
+suffixes; declare them explicitly when native or extracted evidence cannot
+prove the Lua type.
 
 ## Real-world examples
 

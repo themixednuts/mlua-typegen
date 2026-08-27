@@ -1,5 +1,6 @@
 #![feature(rustc_private)]
 
+extern crate rustc_abi;
 extern crate rustc_ast;
 extern crate rustc_driver;
 extern crate rustc_hir;
@@ -12,14 +13,26 @@ mod extract;
 
 use std::path::PathBuf;
 
-use mlua_typegen::CodegenTarget;
+use mlua_typegen::{
+    Dialect,
+    config::{self, ResolvedConfig},
+    driver_protocol::{
+        EVIDENCE_SNAPSHOT_ENV, EXTRACTION_SCOPE_ENV, EvidenceCatalog, FORCE_ANALYZE_ENV,
+        INVOCATION_LEDGER_ENV, InvocationRecord, REPLAY_GENERATION_ENV, UnitManifest,
+    },
+};
 use rustc_driver::Callbacks;
 use rustc_interface::interface;
 use rustc_middle::ty::TyCtxt;
 
 struct LuaTypegenCallbacks {
     output_dir: PathBuf,
-    target: CodegenTarget,
+    dialect: Dialect,
+    config: ResolvedConfig,
+    evidence: EvidenceCatalog,
+    scope: Option<std::collections::BTreeSet<String>>,
+    generation: u32,
+    compiler_args: Vec<String>,
 }
 
 impl Callbacks for LuaTypegenCallbacks {
@@ -30,96 +43,88 @@ impl Callbacks for LuaTypegenCallbacks {
     ) -> rustc_driver::Compilation {
         let crate_name = tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE);
         let crate_name = crate_name.as_str();
-        let api = extract::collect_lua_api(tcx);
+        record_invocation(tcx, crate_name, &self.compiler_args);
+        let compiled = match extract::extract_unit(
+            tcx,
+            &self.config,
+            &self.evidence,
+            self.scope.as_ref(),
+        ) {
+            Ok(compiled) => compiled,
+            Err(diagnostics) => {
+                emit_compile_diagnostics(tcx, &diagnostics);
+                eprintln!(
+                    "mlua-typegen: incomplete run for `{crate_name}`; published no compiler report"
+                );
+                return rustc_driver::Compilation::Stop;
+            }
+        };
 
         if std::env::var("MLUA_TYPEGEN_TRACE").is_ok() {
             eprintln!("[mlua-typegen] driver crate={crate_name}");
-            for class in &api.classes {
-                let interesting: Vec<_> = class
-                    .methods
-                    .iter()
-                    .filter(|m| {
-                        matches!(
-                            m.name.as_str(),
-                            "open"
-                                | "history"
-                                | "ends_with"
-                                | "join"
-                                | "starts_with"
-                                | "strip_prefix"
-                                | "raw"
-                                | "__eq"
-                                | "__pairs"
-                        )
-                    })
-                    .map(|m| format!("{} params={:?} returns={:?}", m.name, m.params, m.returns))
-                    .collect();
-                if !interesting.is_empty()
-                    || matches!(
-                        class.name.as_str(),
-                        "Access" | "Path" | "Url" | "Style" | "File" | "Tab"
-                    )
-                {
-                    eprintln!(
-                        "[mlua-typegen] driver class={} fields={:?} methods={:?}",
-                        class.name, class.fields, interesting
-                    );
-                }
-            }
-            for func in &api.global_functions {
-                if matches!(func.name.as_str(), "Url" | "Path" | "File") {
-                    eprintln!(
-                        "[mlua-typegen] driver global_function={} params={:?} returns={:?}",
-                        func.name, func.params, func.returns
-                    );
-                }
+            eprintln!(
+                "[mlua-typegen] resolved explicit mappings={}",
+                self.config.mappings().len()
+            );
+            eprintln!(
+                "[mlua-typegen] semantic API items={}",
+                compiled.unit.api.item_count()
+            );
+            for conversion in &compiled.unit.conversions {
+                eprintln!("[mlua-typegen] driver conversion={conversion:?}");
             }
         }
 
-        let total = api.classes.len()
-            + api.enums.len()
-            + api.modules.len()
-            + api.global_fields.len()
-            + api.global_functions.len();
-
-        if total > 0 {
-            if let Err(e) = mlua_typegen::codegen::write_stubs_for(
-                &self.output_dir,
-                &api,
-                self.target,
-                crate_name,
-            ) {
-                eprintln!("mlua-typegen: failed to write stubs: {e}");
-            } else {
-                eprintln!(
-                    "mlua-typegen: generated stubs ({} classes, {} enums, {} modules, {} global values, {} global functions) in {}/{}",
-                    api.classes.len(),
-                    api.enums.len(),
-                    api.modules.len(),
-                    api.global_fields.len(),
-                    api.global_functions.len(),
-                    self.output_dir.display(),
-                    crate_name,
-                );
-            }
-        }
-
-        // Write event emissions to shared file for cross-crate callback inference
-        if !api.event_emissions.is_empty() {
-            if let Err(e) = mlua_typegen::codegen::append_event_emissions(
-                &self.output_dir,
-                &api.event_emissions,
-            ) {
-                eprintln!("mlua-typegen: failed to write events: {e}");
-            } else {
-                eprintln!(
-                    "mlua-typegen: recorded {} event emissions from {crate_name}",
-                    api.event_emissions.len()
-                );
-            }
-        }
+        let report = mlua_typegen::driver_protocol::write_unit_report(
+            &self.output_dir,
+            &compiled.unit,
+            &compiled.used_mappings,
+            &UnitManifest {
+                stable_crate_id: tcx.stable_crate_id(rustc_hir::def_id::LOCAL_CRATE).as_u64(),
+                crate_name: crate_name.to_owned(),
+                generation: self.generation,
+                scope: self.scope.clone(),
+                pending: !compiled.requirements.is_empty(),
+                requirements: compiled.requirements,
+                provided_classes: compiled.provided_classes,
+                conversions: compiled.unit.conversions.clone(),
+            },
+            self.dialect,
+            crate_name,
+        )
+        .unwrap_or_else(|error| {
+            tcx.dcx().fatal(format!(
+                "mlua-typegen failed to commit compiler report for `{crate_name}`: {error}"
+            ))
+        });
+        eprintln!(
+            "mlua-typegen: committed {} extracted items from {} to {}",
+            report.item_count,
+            report.crate_name,
+            report.path.display()
+        );
 
         rustc_driver::Compilation::Continue
+    }
+}
+
+fn emit_compile_diagnostics(tcx: TyCtxt<'_>, diagnostics: &extract::CompileDiagnostics) {
+    for diagnostic in diagnostics.iter() {
+        let mut rendered = tcx.dcx().struct_span_err(
+            diagnostic.primary_span(),
+            format!(
+                "[{}] mlua-typegen could not prove an exact Lua type",
+                diagnostic.code()
+            ),
+        );
+        rendered.note(format!("stage: {}", diagnostic.stage()));
+        rendered.note(format!("Rust owner: `{}`", diagnostic.rust_owner()));
+        if let Some(lua_path) = diagnostic.lua_path() {
+            rendered.note(format!("Lua-visible path: `{lua_path}`"));
+        }
+        rendered.note(format!("reason: {}", diagnostic.reason()));
+        rendered.help(diagnostic.remediation());
+        rendered.emit();
     }
 }
 
@@ -139,21 +144,40 @@ fn main() -> std::process::ExitCode {
         let rustc = args[1].clone();
         let rustc_args = &args[2..];
 
-        // RUSTC_WORKSPACE_WRAPPER only sends workspace crates through us,
-        // so every invocation here is a crate we should analyze.
         let output_dir = std::env::var("MLUA_TYPEGEN_OUTPUT")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("lua-types"));
 
-        let target = codegen_target(false);
-
-        let mut callbacks = LuaTypegenCallbacks { output_dir, target };
+        let dialect = codegen_dialect(false);
 
         let compiler_args = make_compiler_args(rustc, rustc_args);
+        let force_analyze = std::env::var_os(FORCE_ANALYZE_ENV).is_some();
+        let primary = std::env::var_os("CARGO_PRIMARY_PACKAGE").is_some();
+        if !primary && !force_analyze {
+            let mut callbacks = RecordingCallbacks {
+                compiler_args: compiler_args.clone(),
+            };
+            return run_compiler_with_exit_code(&compiler_args, &mut callbacks);
+        }
 
-        return rustc_driver::catch_with_exit_code(|| {
-            rustc_driver::run_compiler(&compiler_args, &mut callbacks)
-        });
+        let config = match load_config_snapshot() {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return std::process::ExitCode::FAILURE;
+            }
+        };
+        let mut callbacks = LuaTypegenCallbacks {
+            output_dir,
+            dialect,
+            config,
+            evidence: load_evidence_snapshot(),
+            scope: load_extraction_scope(),
+            generation: replay_generation(),
+            compiler_args: compiler_args.clone(),
+        };
+
+        return run_compiler_with_exit_code(&compiler_args, &mut callbacks);
     }
 
     // Direct invocation mode (not as wrapper)
@@ -165,18 +189,114 @@ fn main() -> std::process::ExitCode {
         .or_else(|| std::env::var("MLUA_TYPEGEN_OUTPUT").ok().map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("lua-types"));
 
-    let target = codegen_target(emit_emmylua);
+    let dialect = codegen_dialect(emit_emmylua);
 
-    let mut callbacks = LuaTypegenCallbacks { output_dir, target };
+    let config = match load_config_snapshot() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
     let compiler_args = if args.len() > 1 {
         make_compiler_args(args[1].clone(), &args[2..])
     } else {
         vec!["rustc".to_string()]
     };
+    let mut callbacks = LuaTypegenCallbacks {
+        output_dir,
+        dialect,
+        config,
+        evidence: load_evidence_snapshot(),
+        scope: load_extraction_scope(),
+        generation: replay_generation(),
+        compiler_args: compiler_args.clone(),
+    };
 
-    rustc_driver::catch_with_exit_code(|| {
-        rustc_driver::run_compiler(&compiler_args, &mut callbacks)
-    })
+    run_compiler_with_exit_code(&compiler_args, &mut callbacks)
+}
+
+struct RecordingCallbacks {
+    compiler_args: Vec<String>,
+}
+
+impl Callbacks for RecordingCallbacks {
+    fn after_analysis(
+        &mut self,
+        _compiler: &interface::Compiler,
+        tcx: TyCtxt<'_>,
+    ) -> rustc_driver::Compilation {
+        let crate_name = tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE);
+        record_invocation(tcx, crate_name.as_str(), &self.compiler_args);
+        rustc_driver::Compilation::Continue
+    }
+}
+
+fn record_invocation(tcx: TyCtxt<'_>, crate_name: &str, compiler_args: &[String]) {
+    let Some(root) = std::env::var_os(INVOCATION_LEDGER_ENV).map(PathBuf::from) else {
+        return;
+    };
+    let stable_crate_id = tcx.stable_crate_id(rustc_hir::def_id::LOCAL_CRATE).as_u64();
+    let record = InvocationRecord {
+        stable_crate_id,
+        crate_name: crate_name.to_owned(),
+        compiler_args: compiler_args.to_vec(),
+    };
+    let bytes = serde_json::to_vec(&record).expect("invocation record is serializable");
+    let temporary = root.join(format!("{stable_crate_id:016x}.{}.tmp", std::process::id()));
+    let destination = root.join(format!("{stable_crate_id:016x}.json"));
+    if std::fs::write(&temporary, bytes).is_ok() {
+        let _ = std::fs::rename(&temporary, destination);
+    }
+}
+
+fn load_evidence_snapshot() -> EvidenceCatalog {
+    let Some(path) = std::env::var_os(EVIDENCE_SNAPSHOT_ENV) else {
+        return EvidenceCatalog::default();
+    };
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn load_extraction_scope() -> Option<std::collections::BTreeSet<String>> {
+    let path = std::env::var_os(EXTRACTION_SCOPE_ENV)?;
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+}
+
+fn replay_generation() -> u32 {
+    std::env::var(REPLAY_GENERATION_ENV)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+fn load_config_snapshot() -> Result<ResolvedConfig, String> {
+    let Some(path) = std::env::var_os(config::CONFIG_SNAPSHOT_ENV) else {
+        return Ok(ResolvedConfig::empty());
+    };
+    ResolvedConfig::from_snapshot(std::path::Path::new(&path)).map_err(|error| error.to_string())
+}
+
+#[cfg(rustc_driver_catch_returns_exit_code)]
+fn run_compiler_with_exit_code<C: Callbacks + Send>(
+    compiler_args: &[String],
+    callbacks: &mut C,
+) -> std::process::ExitCode {
+    rustc_driver::catch_with_exit_code(|| rustc_driver::run_compiler(compiler_args, callbacks))
+}
+
+#[cfg(not(rustc_driver_catch_returns_exit_code))]
+fn run_compiler_with_exit_code<C: Callbacks + Send>(
+    compiler_args: &[String],
+    callbacks: &mut C,
+) -> std::process::ExitCode {
+    std::process::ExitCode::from(rustc_driver::catch_with_exit_code(|| {
+        rustc_driver::run_compiler(compiler_args, callbacks)
+    }) as u8)
 }
 
 fn make_compiler_args(rustc: String, rustc_args: &[String]) -> Vec<String> {
@@ -223,11 +343,11 @@ fn infer_sysroot_from_rustc(rustc: &str) -> Option<String> {
     (!sysroot.is_empty()).then(|| sysroot.to_string())
 }
 
-fn codegen_target(force_emmylua: bool) -> CodegenTarget {
+fn codegen_dialect(force_emmylua: bool) -> Dialect {
     if force_emmylua || std::env::var("MLUA_TYPEGEN_EMMYLUA").is_ok() {
-        CodegenTarget::EmmyLua
+        Dialect::EmmyLua
     } else {
-        CodegenTarget::LuaLS
+        Dialect::LuaLs
     }
 }
 

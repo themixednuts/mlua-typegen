@@ -1,0 +1,111 @@
+{
+  "$id": "https://raw.githubusercontent.com/themixednuts/mlua-typegen/main/schemas/mlua-typegen.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ConfigFile",
+  "type": "object",
+  "properties": {
+    "external_types": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ExternalType"
+      }
+    },
+    "mappings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ConfigMapping"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "ConfigMapping": {
+      "type": "object",
+      "properties": {
+        "from_lua": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "into_lua": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "lua": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "params": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "rust": {
+          "$ref": "#/$defs/RustSelector"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "rust"
+      ]
+    },
+    "ExternalType": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "params": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
+    },
+    "RustSelector": {
+      "type": "object",
+      "properties": {
+        "package": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "package",
+        "path"
+      ]
+    }
+  }
+}

@@ -1,0 +1,73 @@
+supported = ">=0.9.0, <0.13.0"
+
+[[lanes]]
+name = "0.9-min"
+fixture = "0.9-min"
+requirement = ">=0.9.0, <0.10.0"
+locked = "0.9.0"
+expected = "expected/legacy.lua"
+updates = "minimum"
+
+[[lanes]]
+name = "0.9-latest"
+fixture = "0.9-latest"
+requirement = ">=0.9.0, <0.10.0"
+locked = "0.9.9"
+expected = "expected/legacy.lua"
+updates = "latest-patch"
+
+[[lanes]]
+name = "0.10-min"
+fixture = "0.10-min"
+requirement = ">=0.10.0, <0.11.0"
+locked = "0.10.0"
+expected = "expected/legacy.lua"
+updates = "minimum"
+
+[[lanes]]
+name = "0.10-latest"
+fixture = "0.10-latest"
+requirement = ">=0.10.0, <0.11.0"
+locked = "0.10.5"
+expected = "expected/legacy.lua"
+updates = "latest-patch"
+
+[[lanes]]
+name = "0.11-min"
+fixture = "0.11-min"
+requirement = ">=0.11.0, <0.12.0"
+locked = "0.11.0"
+expected = "expected/legacy.lua"
+updates = "minimum"
+
+[[lanes]]
+name = "0.11-pre-once"
+fixture = "0.11-pre-once"
+requirement = ">=0.11.0, <0.12.0"
+locked = "0.11.4"
+expected = "expected/legacy.lua"
+updates = "boundary"
+
+[[lanes]]
+name = "0.11-once"
+fixture = "0.11-once"
+requirement = ">=0.11.0, <0.12.0"
+locked = "0.11.5"
+expected = "expected/once.lua"
+updates = "boundary"
+
+[[lanes]]
+name = "0.11-latest"
+fixture = "0.11-latest"
+requirement = ">=0.11.0, <0.12.0"
+locked = "0.11.6"
+expected = "expected/once.lua"
+updates = "latest-patch"
+
+[[lanes]]
+name = "0.12-min-latest"
+fixture = "0.12-min-latest"
+requirement = ">=0.12.0, <0.13.0"
+locked = "0.12.0"
+expected = "expected/generated.lua"
+updates = "minimum-and-latest"

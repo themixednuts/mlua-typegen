@@ -1,0 +1,13 @@
+[package]
+name = "mlua-compat-09-min"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "../sources/v09.rs"
+
+[dependencies]
+mlua = { version = ">=0.9.0, <0.10.0", features = ["lua54", "async", "module", "macros"] }
+
+[workspace]

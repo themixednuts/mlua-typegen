@@ -1,14 +1,30 @@
 pub mod codegen;
+pub mod config;
+#[doc(hidden)]
+pub mod driver_protocol;
+pub mod generation;
+pub mod identity;
+pub mod semantic;
 pub mod typemap;
+
+pub use identity::{AnnotationId, LuaAccess, LuaName, LuaPath, LuaStringLiteral};
+pub use semantic::{
+    AliasDef, ApiContribution, ClassDef, ExtractedUnit, FieldDef, Origins, OverloadSet, Parameter,
+    Provenance, ReturnValue, SemanticApi, SemanticError, SemanticErrors, Signature, TableDef,
+    TypeDef, TypeExpr, TypeId, TypeParameter, TypeParameterId, ValueDef,
+};
+
+/// Stable `mlua` releases analyzed by this `mlua-typegen` minor line.
+pub const SUPPORTED_MLUA_VERSIONS: &str = ">=0.9.0, <0.13.0";
 
 use std::fmt;
 
-/// Which language server to target for codegen.
+/// Annotation dialect emitted from the target-neutral semantic API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CodegenTarget {
+pub enum Dialect {
     /// LuaCATS annotations (used by LuaLS). This is the default.
     #[default]
-    LuaLS,
+    LuaLs,
     /// EmmyLua annotations (EmmyLua plugin for IntelliJ / VS Code).
     EmmyLua,
 }
@@ -24,14 +40,42 @@ pub enum LuaType {
     Table,
     Function,
     Any,
+    Dynamic(String),
+    Literal(LuaLiteral),
     /// A typed array: `T[]`
     Array(Box<LuaType>),
     /// An optional type: `T?`
     Optional(Box<LuaType>),
     /// A typed table: `table<K, V>`
     Map(Box<LuaType>, Box<LuaType>),
+    /// An inline table shape proven from conversion code.
+    Record {
+        fields: Vec<LuaRecordField>,
+        open: bool,
+    },
     /// A reference to another UserData class or alias by name.
     Class(String),
+    /// A resolved Rust definition whose Lua contract still needs native,
+    /// extracted, or configured evidence.
+    #[doc(hidden)]
+    UnresolvedRust {
+        path: String,
+        arguments: Vec<LuaType>,
+    },
+    /// A definition owned by another compiled Rust crate whose source evidence
+    /// may need to be replayed through the driver.
+    #[doc(hidden)]
+    ExternalRust {
+        path: String,
+        arguments: Vec<LuaType>,
+        stable_crate_id: u64,
+    },
+    /// A statically known Rust type form that the extractor cannot prove.
+    #[doc(hidden)]
+    UnsupportedStatic {
+        rust_type: String,
+        reason: String,
+    },
     /// A union of string literals: `"a" | "b" | "c"`
     StringLiteral(Vec<String>),
     /// A union of types: `T | U`
@@ -47,6 +91,71 @@ pub enum LuaType {
     },
 }
 
+/// A scalar literal proven by conversion-body analysis.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub enum LuaLiteral {
+    Boolean(bool),
+    Integer(i64),
+    /// IEEE-754 bits preserve equality without imposing an artificial ordering.
+    Number(u64),
+    String(String),
+}
+
+/// The openness of a table produced or accepted by a conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum TableOpenness {
+    Closed,
+    Open,
+}
+
+/// A statically proven field in a Lua table conversion.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct LuaTableField {
+    pub name: String,
+    pub value: LuaValueDomain,
+}
+
+/// One field in an inline structural Lua table type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LuaRecordField {
+    pub name: String,
+    pub ty: LuaType,
+}
+
+/// A table shape derived from resolved table operations.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct LuaTableShape {
+    pub fields: Vec<LuaTableField>,
+    pub openness: TableOpenness,
+}
+
+/// The exact Lua value domain of one conversion direction.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum LuaValueDomain {
+    Nil,
+    Boolean,
+    Integer,
+    Number,
+    String,
+    Literal(LuaLiteral),
+    Table(LuaTableShape),
+    UserData(String),
+    Function,
+    Thread,
+    Union(Vec<LuaValueDomain>),
+}
+
+/// The independently analyzed input and output contracts of a Rust type.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ConversionContract {
+    pub rust_path: String,
+    pub rust_type: String,
+    pub into_lua: Option<LuaValueDomain>,
+    pub from_lua: Option<LuaValueDomain>,
+}
+
 impl fmt::Display for LuaType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -58,6 +167,13 @@ impl fmt::Display for LuaType {
             LuaType::Table => write!(f, "table"),
             LuaType::Function => write!(f, "function"),
             LuaType::Any => write!(f, "any"),
+            LuaType::Dynamic(_) => write!(f, "any"),
+            LuaType::Literal(value) => match value {
+                LuaLiteral::Boolean(value) => write!(f, "{value}"),
+                LuaLiteral::Integer(value) => write!(f, "{value}"),
+                LuaLiteral::Number(bits) => write!(f, "{}", f64::from_bits(*bits)),
+                LuaLiteral::String(value) => write!(f, "\"{value}\""),
+            },
             LuaType::Array(inner) => {
                 if matches!(inner.as_ref(), LuaType::Optional(_) | LuaType::Map(_, _)) {
                     write!(f, "({inner})[]")
@@ -76,7 +192,52 @@ impl fmt::Display for LuaType {
                 }
             }
             LuaType::Map(k, v) => write!(f, "table<{k}, {v}>"),
+            LuaType::Record { fields, .. } => {
+                f.write_str("{ ")?;
+                for (index, field) in fields.iter().enumerate() {
+                    if index != 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{}: {}", field.name, field.ty)?;
+                }
+                f.write_str(" }")
+            }
             LuaType::Class(name) => write!(f, "{}", format_embedded_class_name(name)),
+            LuaType::UnresolvedRust { path, arguments } => {
+                if arguments.is_empty() {
+                    f.write_str(path)
+                } else {
+                    write!(
+                        f,
+                        "{}<{}>",
+                        path,
+                        arguments
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
+            }
+            LuaType::ExternalRust {
+                path, arguments, ..
+            } => {
+                if arguments.is_empty() {
+                    f.write_str(path)
+                } else {
+                    write!(
+                        f,
+                        "{}<{}>",
+                        path,
+                        arguments
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
+            }
+            LuaType::UnsupportedStatic { rust_type, .. } => f.write_str(rust_type),
             LuaType::StringLiteral(variants) => {
                 for (i, v) in variants.iter().enumerate() {
                     if i > 0 {
@@ -276,7 +437,7 @@ impl LuaReturn {
 }
 
 /// Whether a method takes `self` or is static.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MethodKind {
     Method,
     Function,
@@ -450,9 +611,11 @@ pub struct EventEmission {
     pub arg_types: Vec<LuaType>,
 }
 
-/// The complete Lua API surface extracted from a crate.
-#[derive(Debug, Clone, Default)]
-pub struct LuaApi {
+/// Mutable rustc extraction facts before semantic assembly.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct ExtractedApi {
+    pub provenance: Provenance,
     pub classes: Vec<LuaClass>,
     pub enums: Vec<LuaEnum>,
     pub modules: Vec<LuaModule>,
@@ -460,6 +623,24 @@ pub struct LuaApi {
     pub global_functions: Vec<LuaFunction>,
     /// Event emissions found in this crate (event_name → arg types).
     pub event_emissions: Vec<EventEmission>,
+    /// Exact directional conversion behavior, kept separate from rendered aliases.
+    pub conversions: Vec<ConversionContract>,
+}
+
+impl ExtractedApi {
+    #[must_use]
+    pub fn new(provenance: Provenance) -> Self {
+        Self {
+            provenance,
+            classes: Vec::new(),
+            enums: Vec::new(),
+            modules: Vec::new(),
+            global_fields: Vec::new(),
+            global_functions: Vec::new(),
+            event_emissions: Vec::new(),
+            conversions: Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]

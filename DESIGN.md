@@ -1,5 +1,16 @@
 # mlua-typegen
 
+Exact `IntoLua` and `FromLua` behavior is modeled as separate directional
+contracts. See [the accepted conversion-semantics decision](docs/decisions/conversion-semantics.md).
+
+Lua-visible registrations use exact segmented identities, with source,
+annotation, diagnostic, and filesystem projections kept separate. See
+[the accepted Lua identity decision](docs/decisions/lua-identity.md).
+
+Extraction facts cross into code generation through one immutable semantic
+graph. LuaLS and EmmyLua capability checks run before their renderers. See
+[the semantic API decision](docs/decisions/semantic-api.md).
+
 A rustc driver tool that extracts fully-inferred Lua type information from `mlua` UserData implementations and generates LuaCATS-compatible type stub files for LuaLS and EmmyLua LSPs.
 
 ## How It Works
@@ -8,14 +19,13 @@ Uses the same technique as clippy/miri — a custom `rustc` driver that hooks in
 
 ```
 cargo mlua-typegen --output types/
+  → acquires the output-directory lock
+  → creates a private run workspace and fresh Cargo target directory
   → sets RUSTC_WRAPPER=mlua-typegen-driver
-    → drives rustc as a library
-      → normal compilation + type checking runs
-      → after_analysis callback walks HIR with full TyCtxt
-      → finds all `impl UserData` blocks
-      → extracts method names, param types, return types from closures
-      → maps Rust types → Lua types
-      → writes .lua stub files with LuaCATS annotations
+    → records every Cargo rustc invocation and extracts primary crates
+  → coordinator replays only reachable dependency owners under a typed scope
+  → accepts only completion-marked reports and resolves facts to a fixed point
+  → one atomic rename publishes types/mlua-typegen.lua
 ```
 
 ## Architecture
@@ -25,12 +35,35 @@ mlua-typegen/
 ├── src/
 │   ├── lib.rs              # Shared types and Rust→Lua type mapping
 │   ├── driver.rs           # rustc driver (Callbacks impl)
-│   ├── extract.rs          # HIR walker: find impl UserData blocks, extract type info
+│   ├── driver_protocol.rs  # Isolated compiler-unit report protocol
+│   ├── generation.rs       # Deterministic assembly and atomic publication
+│   ├── extract.rs          # Thin orchestration entry point
+│   ├── extract/
+│   │   ├── plan.rs         # Build a crate extraction plan from HIR items
+│   │   ├── pipeline.rs     # ApiCompiler: plan -> emit -> assemble
+│   │   ├── emit/           # Classes, modules, registrations, events, callbacks
+│   │   ├── lower.rs        # rustc ty::Ty -> Lua type lowering helpers
+│   │   ├── returns/        # Return-value inference and naming
+│   │   ├── table/          # Table, converter, and param-use inference
+│   │   └── finish.rs       # Dedupe and normalize private extraction facts
+│   ├── semantic.rs         # Contributions, immutable graph, canonical merge
 │   ├── typemap.rs          # Rust ty::Ty → Lua type string mapping
-│   └── codegen.rs          # Emit .lua stub files (LuaCATS format)
+│   ├── codegen.rs          # Semantic rendering entry point and report I/O
+│   └── codegen/
+│       ├── dialect.rs      # Closed capability matrix and fail-closed dispatch
+│       └── render.rs       # Annotation document rendering
 ```
 
 ## Extraction Pipeline
+
+The extractor is structured like a small compiler:
+
+1. `plan` walks the crate HIR once and records the work items worth extracting.
+2. `emit` dispatches each work item to the module that owns that source pattern.
+3. `lower`, `table`, `returns`, `fields`, and `signature` perform local analysis and type lowering.
+4. `finish` deduplicates extraction facts and normalizes type references.
+5. The extractor turns those facts into owned `ApiContribution` values. `SemanticApi::assemble` is the only merge and collision boundary.
+6. The selected dialect rejects unsupported semantic features before rendering.
 
 ### 1. Find UserData impls
 
@@ -84,20 +117,20 @@ Output format (compatible with both LuaLS and EmmyLua):
 ```lua
 ---@meta
 
----@class Buffer
+---@class (exact) Buffer
 ---@field document_id string
 local Buffer = {}
 
 ---@return string
-function Buffer:get_text() end
+Buffer["get_text"] = function(self) end
 
 ---@param start Position
 ---@param stop Position
 ---@return string
-function Buffer:get_range_text(start, stop) end
+Buffer["get_range_text"] = function(self, start, stop) end
 
 ---@return Diagnostic[]
-function Buffer:diagnostics() end
+Buffer["diagnostics"] = function(self) end
 ```
 
 ## Rustc Driver Details
@@ -117,7 +150,7 @@ use rustc_driver::Callbacks;
 use rustc_middle::ty::TyCtxt;
 
 struct LuaTypegenCallbacks {
-    output_dir: PathBuf,
+    report_root: PathBuf,
 }
 
 impl Callbacks for LuaTypegenCallbacks {
@@ -125,10 +158,18 @@ impl Callbacks for LuaTypegenCallbacks {
         &mut self,
         _compiler: &interface::Compiler,
         tcx: TyCtxt<'tcx>,
-    ) -> bool {
-        let types = extract::collect_lua_types(tcx);
-        codegen::write_stubs(&self.output_dir, &types);
-        true // stop after analysis, don't codegen
+    ) -> rustc_driver::Compilation {
+        let crate_name = tcx.crate_name(rustc_hir::def_id::LOCAL_CRATE);
+        let unit = extract::extract_unit(tcx)
+            .unwrap_or_else(|error| tcx.dcx().fatal(error.to_string()));
+        driver_protocol::write_unit_report(
+            &self.report_root,
+            &unit,
+            self.dialect,
+            crate_name.as_str(),
+        )
+        .unwrap_or_else(|error| tcx.dcx().fatal(error.to_string()));
+        rustc_driver::Compilation::Continue
     }
 }
 ```
@@ -188,7 +229,10 @@ cargo mlua-typegen --output lua/types/
 cargo mlua-typegen -p my-plugin-crate --output lua/types/
 ```
 
-The generated `lua/types/` directory can be added to your LSP's library paths:
+The `rust-toolchain.toml` and build script handle `rustc-dev`; users should not need a separate component setup step.
+
+The generated `lua/types/mlua-typegen.lua` snapshot lives in a directory that can
+be added to your LSP's library paths:
 
 ```json
 // .luarc.json (LuaLS)
@@ -208,9 +252,9 @@ The generated `lua/types/` directory can be added to your LSP's library paths:
 
 ## Build Requirements
 
-- **Tool build**: requires nightly (`rustc_private` feature)
+- **Tool build**: requires nightly (`rustc_private` feature); `rustc-dev` is installed automatically when missing
 - **User projects**: no requirements — works on stable Rust, zero code changes needed
-- **Nightly pinning**: like clippy, the tool should pin to a specific nightly version and track updates
+- **Rust version**: requires Rust 1.98 and pins `nightly-2026-06-30`; newer nightlies are best-effort and older compilers fail fast in `build.rs`
 
 ## Open Questions
 

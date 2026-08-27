@@ -1,3 +1,8 @@
-/target
+**/target/
 .claude
 /tmp
+/.codemogger
+/*.dll
+/*.log
+/NUL
+*.session-recovered
