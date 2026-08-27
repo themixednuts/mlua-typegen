@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Semantic API boundary lab</title>
+  <style>
+    :root { color-scheme: light; --ink:#17202a; --muted:#607080; --line:#d9e1e8; --paper:#f5f7f9; --card:#fff; --accent:#0b6bcb; --good:#087f5b; --bad:#c92a2a; --warn:#9c6500; }
+    * { box-sizing:border-box; }
+    body { margin:0; font:15px/1.48 Inter, ui-sans-serif, system-ui, sans-serif; color:var(--ink); background:var(--paper); }
+    main { max-width:1180px; margin:auto; padding:42px 24px 80px; }
+    h1 { margin:0 0 8px; font-size:32px; letter-spacing:-.03em; }
+    h2 { margin:0 0 14px; font-size:19px; }
+    h3 { margin:0 0 8px; font-size:15px; }
+    p { margin:0 0 14px; }
+    .intro { max-width:850px; color:var(--muted); font-size:16px; }
+    .label { text-transform:uppercase; letter-spacing:.09em; color:var(--muted); font-size:11px; font-weight:700; }
+    .architectures { display:grid; grid-template-columns:repeat(3,1fr); gap:14px; margin:28px 0; }
+    button { border:1px solid var(--line); background:var(--card); color:var(--ink); border-radius:8px; padding:10px 12px; cursor:pointer; font:inherit; text-align:left; }
+    button:hover { border-color:#93bce5; }
+    button.selected { border:2px solid var(--accent); padding:9px 11px; box-shadow:0 0 0 3px #dcecff; }
+    .arch strong { display:block; margin-bottom:5px; }
+    .arch span { color:var(--muted); font-size:13px; }
+    .toolbar { display:flex; gap:8px; flex-wrap:wrap; padding:14px; border:1px solid var(--line); background:var(--card); border-radius:10px; }
+    .toolbar button { padding:7px 10px; }
+    .toolbar button.primary { color:white; border-color:var(--accent); background:var(--accent); }
+    .dialects { margin-left:auto; display:flex; gap:6px; }
+    .grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-top:14px; }
+    .panel { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:18px; min-height:230px; }
+    .panel.wide { grid-column:1/-1; min-height:0; }
+    pre { margin:0; white-space:pre-wrap; overflow-wrap:anywhere; background:#111923; color:#dce8f2; border-radius:7px; padding:14px; font:12px/1.55 ui-monospace, SFMono-Regular, Consolas, monospace; min-height:170px; }
+    .state-list { display:grid; gap:8px; }
+    .state-row { display:flex; justify-content:space-between; gap:16px; border-bottom:1px solid #edf1f4; padding:5px 0; }
+    .state-row span:last-child { text-align:right; font-family:ui-monospace, monospace; }
+    .good { color:var(--good); } .bad { color:var(--bad); } .warn { color:var(--warn); }
+    .history { margin:12px 0 0; padding-left:20px; color:var(--muted); }
+    .walkthroughs { margin-top:28px; }
+    .tabs { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px; }
+    .scenario { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:18px; }
+    .steps { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
+    .steps button.done { color:var(--good); border-color:#a9d8c8; background:#effaf6; }
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    th,td { padding:9px 10px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }
+    th { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.06em; }
+    .recommendation { margin-top:28px; padding:20px; border-left:4px solid var(--accent); background:#eaf4ff; border-radius:5px; }
+    @media(max-width:800px){ .architectures,.grid{grid-template-columns:1fr}.panel.wide{grid-column:auto}.dialects{margin-left:0}.toolbar{align-items:stretch}.toolbar button{flex:1 1 140px} }
+  </style>
+</head>
+<body>
+<main>
+  <div class="label">Throwaway logic prototype</div>
+  <h1>Where should semantic truth stop?</h1>
+  <p class="intro">This lab asks which model can preserve exact Lua identities, Rust-derived types, overload relationships, generics, module reopening, and provenance while LuaLS and EmmyLua evolve independently. Choose an architecture, add facts in any order, and watch what survives.</p>
+
+  <section class="architectures" aria-label="Architecture choices">
+    <button class="arch" data-arch="bags"><strong>A · Renderer-shaped bags</strong><span>Keep today’s parallel vectors and let each writer infer meaning.</span></button>
+    <button class="arch" data-arch="ast"><strong>B · Common annotation AST</strong><span>Convert early to one shared tree of annotation syntax.</span></button>
+    <button class="arch" data-arch="graph"><strong>C · Semantic graph + adapters</strong><span>Validate meaning once; lower and check each dialect independently.</span></button>
+  </section>
+
+  <section>
+    <div class="toolbar" aria-label="Free play actions">
+      <button data-action="class">Define generic class</button>
+      <button data-action="primary">Bind at toolkit.box</button>
+      <button data-action="alias">Alias at legacy.box</button>
+      <button data-action="overload">Add generic overloads</button>
+      <button data-action="reopen">Reopen module compatibly</button>
+      <button data-action="conflict">Add conflicting field</button>
+      <button data-action="gap">Add dialect-only feature</button>
+      <button data-action="reset">Reset</button>
+      <div class="dialects" aria-label="Rendered dialect">
+        <button data-dialect="luals">LuaLS</button>
+        <button data-dialect="emmy">EmmyLua</button>
+      </div>
+    </div>
+
+    <div class="grid">
+      <section class="panel"><h2>Facts supplied</h2><div id="facts" class="state-list"></div><ol id="history" class="history"></ol></section>
+      <section class="panel"><h2>Model state</h2><div id="model" class="state-list"></div></section>
+      <section class="panel"><h2>Selected dialect output</h2><pre id="output"></pre></section>
+      <section class="panel"><h2>What happened</h2><div id="diagnostics" class="state-list"></div></section>
+      <section class="panel wide"><h2>Invariant scorecard</h2><div id="scorecard"></div></section>
+    </div>
+  </section>
+
+  <section class="walkthroughs">
+    <h2>Guided walkthroughs</h2>
+    <div class="tabs" id="tabs"></div>
+    <div class="scenario">
+      <h3 id="scenario-title"></h3>
+      <p id="scenario-copy"></p>
+      <div class="steps" id="steps"></div>
+    </div>
+  </section>
+
+  <aside class="recommendation">
+    <div class="label">Recommended verdict</div>
+    <h2>Choose C: one semantic graph, two fail-closed adapters</h2>
+    <p>Extraction emits owned, provenance-carrying contributions. Assembly is the only place that can merge, resolve references, and reject collisions. LuaLS and EmmyLua each lower the complete graph and must report an unsupported feature instead of dropping it or widening it to <code>any</code>. Real analyzer validation gates publication.</p>
+  </aside>
+</main>
+
+<script>
+const SemanticLab = (() => {
+  const architectures = {
+    bags: { name: "Renderer-shaped bags", owner: "Each renderer", typeRefs: "strings", overloads: "duplicate names", provenance: "not retained" },
+    ast: { name: "Common annotation AST", owner: "Shared syntax tree", typeRefs: "annotation text", overloads: "annotation siblings", provenance: "detached metadata" },
+    graph: { name: "Semantic graph + adapters", owner: "Semantic assembler", typeRefs: "TypeId + arity", overloads: "NonEmpty<Signature>", provenance: "on every contribution" }
+  };
+
+  const actions = {
+    class: { label: "Defined Box<T> from crate_a::Box", key: "class" },
+    primary: { label: "Bound Box<string> at [toolkit, box]", key: "primary" },
+    alias: { label: "Bound the same type at [legacy, box]", key: "alias" },
+    overload: { label: "Added map<T,U> overload set", key: "overload" },
+    reopen: { label: "Reopened toolkit with compatible field", key: "reopen" },
+    conflict: { label: "Reopened toolkit.box with conflicting kind", key: "conflict" },
+    gap: { label: "Added correlated return tuples", key: "gap" }
+  };
+
+  const initial = () => ({ architecture: "graph", dialect: "luals", facts: {}, history: [] });
+
+  function reduce(state, event) {
+    if (event.type === "reset") return { ...initial(), architecture: state.architecture, dialect: state.dialect };
+    if (event.type === "architecture") return { ...state, architecture: event.value };
+    if (event.type === "dialect") return { ...state, dialect: event.value };
+    const action = actions[event.type];
+    if (!action || state.facts[action.key]) return state;
+    return { ...state, facts: { ...state.facts, [action.key]: true }, history: [...state.history, action.label] };
+  }
+
+  function derive(state) {
+    const f = state.facts;
+    const a = state.architecture;
+    const conflict = !!f.conflict;
+    const graphRejected = a === "graph" && conflict;
+    const facts = Object.keys(f).length;
+    const bindings = (f.primary ? 1 : 0) + (f.alias ? 1 : 0);
+    const types = f.class ? 1 : 0;
+    const provenance = a === "graph" ? facts : a === "ast" ? Math.min(facts, 1) : 0;
+    const lost = [];
+    if (a === "bags" && f.alias) lost.push("type identity duplicated across Lua paths");
+    if (a === "bags" && f.overload) lost.push("generic scope inferred from repeated names");
+    if (a === "bags" && f.reopen) lost.push("merge result depends on vector order");
+    if (a !== "graph" && conflict) lost.push("conflict silently keeps one definition");
+    if (a === "ast" && f.gap) lost.push("feature erased to common annotation subset");
+    if (a === "bags" && f.gap) lost.push("unsupported feature widened to any");
+    const errors = [];
+    if (graphRejected) errors.push("SemanticError::ConflictingKinds with both source locations");
+    if (a === "graph" && f.gap && state.dialect === "luals") errors.push("RenderError::UnsupportedFeature(correlated return tuples)");
+    return { facts, bindings, types, provenance, lost, errors, publishable: errors.length === 0 && !graphRejected };
+  }
+
+  function render(state, derived) {
+    if (derived.errors.length) return "-- generation stopped\n-- " + derived.errors.join("\n-- ");
+    const f = state.facts;
+    const lines = ["---@meta"];
+    if (f.class) {
+      if (state.architecture === "bags") lines.push("", "---@class Box<T>", "local Box = {}");
+      else if (state.architecture === "ast") lines.push("", "---@class Box<T>", "local Box = {}");
+      else lines.push("", state.dialect === "emmy" ? "---@class (exact) Box<T>" : "---@class (exact) Box<T>", "local Box = {}");
+    }
+    if (f.primary) lines.push("", "---@type Box<string>", '_G["toolkit"]["box"] = _G["toolkit"]["box"]');
+    if (f.alias) {
+      if (state.architecture === "bags") lines.push("", "---@class Box", 'legacy.box = {} -- duplicate shape');
+      else lines.push("", "---@type Box<string>", '_G["legacy"]["box"] = _G["legacy"]["box"]');
+    }
+    if (f.overload) {
+      lines.push("", "---@generic T, U", "---@param items T[]", "---@param f fun(item: T): U", "---@return U[]", "---@overload fun(items: integer[], f: fun(item: integer): string): string[]", '_G["map"] = function(items, f) end');
+    }
+    if (f.reopen) lines.push("", "---@field version string");
+    if (f.conflict && state.architecture !== "graph") lines.push("", "-- conflicting function/table contribution was overwritten");
+    if (f.gap) {
+      if (state.architecture === "graph") lines.push("", "---@return_overload true, string", "---@return_overload false, Error");
+      else if (state.architecture === "ast") lines.push("", "---@return boolean, string|Error -- correlation lost");
+      else lines.push("", "---@return any -- unsupported shape widened");
+    }
+    return lines.join("\n");
+  }
+
+  const scores = {
+    bags: ["no", "no", "no", "partial", "no", "no"],
+    ast: ["partial", "partial", "no", "yes", "no", "partial"],
+    graph: ["yes", "yes", "yes", "yes", "yes", "yes"]
+  };
+
+  return { architectures, actions, initial, reduce, derive, render, scores };
+})();
+
+const scenarios = [
+  { id:"identity", title:"One Rust type, two Lua identities", copy:"Define one generic class and bind it at two exact paths. Watch whether the model duplicates the type or keeps bindings separate from type identity.", steps:["class","primary","alias"] },
+  { id:"overloads", title:"Generic relationships across overloads", copy:"Add a scoped generic overload. The important information is the relationship among T, U, input callback, and output—not the annotation spelling.", steps:["class","overload"] },
+  { id:"merge", title:"Compatible reopening, then collision", copy:"Two units contribute to one module. A compatible extension should be order-independent; an incompatible kind must cite both sources and stop publication.", steps:["class","primary","reopen","conflict"] },
+  { id:"dialect", title:"A dialect capability gap", copy:"Add a semantic feature that one selected analyzer cannot express. Switch dialects: exact generation must fail closed instead of silently degrading.", steps:["class","gap"] }
+];
+
+let state = SemanticLab.initial();
+let activeScenario = scenarios[0];
+let completedSteps = new Set();
+
+function row(label, value, tone="") { return `<div class="state-row"><span>${label}</span><span class="${tone}">${value}</span></div>`; }
+
+function draw() {
+  const a = SemanticLab.architectures[state.architecture];
+  const d = SemanticLab.derive(state);
+  document.querySelectorAll("[data-arch]").forEach(x => x.classList.toggle("selected", x.dataset.arch === state.architecture));
+  document.querySelectorAll("[data-dialect]").forEach(x => x.classList.toggle("selected", x.dataset.dialect === state.dialect));
+  document.getElementById("facts").innerHTML = row("Contributions", d.facts) + row("Type definitions", state.facts.class ? "Box<T>" : "none") + row("Lua bindings", d.bindings) + row("Selected dialect", state.dialect === "luals" ? "LuaLS" : "EmmyLua");
+  document.getElementById("history").innerHTML = state.history.map(x => `<li>${x}</li>`).join("") || "<li>No facts yet.</li>";
+  document.getElementById("model").innerHTML = row("Invariant owner", a.owner) + row("Type references", a.typeRefs) + row("Overloads", a.overloads) + row("Provenances retained", `${d.provenance}/${d.facts}`, d.provenance === d.facts ? "good" : "warn") + row("Publishable", d.publishable ? "yes" : "no", d.publishable ? "good" : "bad");
+  document.getElementById("output").textContent = SemanticLab.render(state, d);
+  const findings = [...d.lost.map(x => ["Lost", x, "warn"]), ...d.errors.map(x => ["Rejected", x, "bad"])];
+  document.getElementById("diagnostics").innerHTML = findings.length ? findings.map(x => row(x[0], x[1], x[2])).join("") : row("Result", "all supplied facts preserved", "good");
+  const labels = ["Exact type/binding identity", "Scoped generics", "Order-independent merge", "Independent dialect syntax", "Fail-closed capability gaps", "Provenance-rich conflicts"];
+  document.getElementById("scorecard").innerHTML = `<table><thead><tr><th>Invariant</th><th>A · Bags</th><th>B · Annotation AST</th><th>C · Semantic graph</th></tr></thead><tbody>${labels.map((l,i)=>`<tr><td>${l}</td>${["bags","ast","graph"].map(k=>`<td class="${SemanticLab.scores[k][i] === "yes" ? "good" : SemanticLab.scores[k][i] === "no" ? "bad" : "warn"}">${SemanticLab.scores[k][i]}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+  document.querySelectorAll("[data-scenario]").forEach(x => x.classList.toggle("selected", x.dataset.scenario === activeScenario.id));
+  document.getElementById("scenario-title").textContent = activeScenario.title;
+  document.getElementById("scenario-copy").textContent = activeScenario.copy;
+  document.getElementById("steps").innerHTML = activeScenario.steps.map((x,i)=>`<button data-step="${x}" class="${completedSteps.has(x) ? "done" : ""}">${i+1}. ${SemanticLab.actions[x].label}</button>`).join("");
+}
+
+document.querySelectorAll("[data-arch]").forEach(x => x.addEventListener("click", () => { state = SemanticLab.reduce(state,{type:"architecture",value:x.dataset.arch}); draw(); }));
+document.querySelectorAll("[data-action]").forEach(x => x.addEventListener("click", () => { state = SemanticLab.reduce(state,{type:x.dataset.action}); draw(); }));
+document.querySelectorAll("[data-dialect]").forEach(x => x.addEventListener("click", () => { state = SemanticLab.reduce(state,{type:"dialect",value:x.dataset.dialect}); draw(); }));
+
+const tabs = document.getElementById("tabs");
+scenarios.forEach(s => { const b=document.createElement("button"); b.dataset.scenario=s.id; b.textContent=s.title; b.addEventListener("click",()=>{ activeScenario=s; completedSteps=new Set(); state=SemanticLab.reduce(state,{type:"reset"}); draw(); }); tabs.appendChild(b); });
+document.getElementById("steps").addEventListener("click", e => { if (!e.target.dataset.step) return; completedSteps.add(e.target.dataset.step); state=SemanticLab.reduce(state,{type:e.target.dataset.step}); draw(); });
+
+draw();
+</script>
+</body>
+</html>
