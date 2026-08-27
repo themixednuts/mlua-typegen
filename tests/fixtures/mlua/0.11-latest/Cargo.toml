@@ -8,6 +8,6 @@ publish = false
 path = "../sources/v11_once.rs"
 
 [dependencies]
-mlua = { version = ">=0.11.0, <0.12.0", features = ["lua54", "async", "module", "macros"] }
+mlua = { version = ">=0.11.0, <0.13.0", features = ["lua54", "async", "module", "macros"] }
 
 [workspace]
