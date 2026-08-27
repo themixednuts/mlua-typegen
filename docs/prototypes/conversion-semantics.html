@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PROTOTYPE — mlua conversion semantics</title>
+  <style>
+    :root { color-scheme: light; --ink:#17221d; --muted:#65736c; --line:#d7dfda; --paper:#f7f8f4; --card:#fff; --accent:#236b4b; --warn:#9b3b2c; --soft:#e9f3ed; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--paper); color:var(--ink); font:15px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; }
+    main { width:min(1180px,calc(100% - 32px)); margin:36px auto 64px; }
+    h1,h2,h3,p { margin-top:0; }
+    h1 { margin-bottom:8px; font-size:clamp(26px,4vw,42px); letter-spacing:-.035em; }
+    h2 { font-size:18px; margin-bottom:14px; }
+    h3 { font-size:14px; text-transform:uppercase; letter-spacing:.07em; color:var(--muted); }
+    .eyebrow { color:var(--accent); font-weight:700; text-transform:uppercase; letter-spacing:.1em; font-size:12px; }
+    .intro { max-width:850px; color:#405048; font-size:17px; }
+    .notice { border-left:4px solid var(--accent); padding:12px 16px; background:var(--soft); margin:24px 0; }
+    .grid { display:grid; grid-template-columns:minmax(280px,.8fr) minmax(420px,1.4fr); gap:18px; align-items:start; }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px; box-shadow:0 2px 10px rgba(21,42,31,.035); }
+    .stack { display:grid; gap:10px; }
+    button { appearance:none; border:1px solid #bac7c0; border-radius:8px; background:#fff; color:var(--ink); padding:10px 12px; text-align:left; cursor:pointer; font:inherit; }
+    button:hover { border-color:var(--accent); }
+    button.active { background:var(--accent); border-color:var(--accent); color:#fff; }
+    button.primary { background:var(--accent); color:#fff; border-color:var(--accent); font-weight:700; text-align:center; }
+    button:disabled { opacity:.5; cursor:not-allowed; }
+    .strategy small,.case small { display:block; opacity:.78; margin-top:3px; }
+    .state-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }
+    .field { border:1px solid var(--line); border-radius:9px; padding:12px; min-height:82px; }
+    .field.wide { grid-column:1/-1; }
+    .label { display:block; color:var(--muted); font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:.07em; margin-bottom:5px; }
+    .value { white-space:pre-wrap; overflow-wrap:anywhere; }
+    .status { display:inline-flex; border-radius:999px; padding:4px 9px; background:#e8ece9; font-weight:700; font-size:12px; }
+    .status.exact { background:#daf0e2; color:#175d3d; }
+    .status.wrong,.status.unsupported { background:#f7e1dd; color:var(--warn); }
+    pre { margin:0; padding:14px; border-radius:9px; background:#17221d; color:#e8f0eb; overflow:auto; font:13px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace; }
+    .tabs { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:14px; }
+    .tabs button { padding:8px 11px; }
+    .walkthrough { margin-top:18px; }
+    .steps { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
+    .steps button.done { background:#edf1ee; text-decoration:line-through; }
+    .decision { margin-top:18px; border:1px solid #b9d7c6; background:#f2f8f4; }
+    .comparison { width:100%; border-collapse:collapse; font-size:14px; }
+    .comparison th,.comparison td { padding:9px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }
+    .comparison th { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.05em; }
+    @media (max-width:820px) { .grid { grid-template-columns:1fr; } .state-grid { grid-template-columns:1fr; } .field.wide { grid-column:auto; } }
+  </style>
+</head>
+<body>
+<main>
+  <div class="eyebrow">Throwaway decision prototype</div>
+  <h1>What did the conversion actually say?</h1>
+  <p class="intro">This demo tests one question: should Lua types come from Rust names, source-spelling patterns, or the resolved behavior of each <code>IntoLua</code> and <code>FromLua</code> implementation? Pick an approach and push it through cases where naming guesses become false.</p>
+  <div class="notice"><strong>What to decide:</strong> whether direction-aware semantic tracing is the right authority, including its distinction between a runtime-computed but exact <code>string</code> and an unsupported static conversion that must stop publication.</div>
+
+  <div class="grid">
+    <section class="card">
+      <h2>1. Choose the authority</h2>
+      <div id="strategies" class="stack"></div>
+      <h2 style="margin-top:24px">2. Choose a conversion</h2>
+      <div id="cases" class="stack"></div>
+      <button id="analyze" class="primary" style="width:100%;margin-top:16px">Analyze selected conversion</button>
+    </section>
+
+    <section class="card">
+      <h2>Current analysis state</h2>
+      <div class="state-grid">
+        <div class="field"><span class="label">Authority</span><div id="authority" class="value"></div></div>
+        <div class="field"><span class="label">Outcome</span><div id="status" class="value"></div></div>
+        <div class="field"><span class="label">IntoLua produces</span><div id="into" class="value"></div></div>
+        <div class="field"><span class="label">FromLua accepts</span><div id="from" class="value"></div></div>
+        <div class="field wide"><span class="label">Evidence used</span><div id="evidence" class="value"></div></div>
+        <div class="field wide"><span class="label">Publication consequence</span><div id="publication" class="value"></div></div>
+        <div class="field wide"><span class="label">Last change</span><div id="change" class="value"></div></div>
+      </div>
+      <h3 style="margin-top:20px">Representative conversion</h3>
+      <pre id="source"></pre>
+    </section>
+  </div>
+
+  <section class="card walkthrough">
+    <h2>Guided walkthroughs</h2>
+    <div id="tabs" class="tabs"></div>
+    <div id="walkthrough"></div>
+  </section>
+
+  <section class="card decision">
+    <h2>Decision under test</h2>
+    <table class="comparison">
+      <thead><tr><th>Approach</th><th>What it gets right</th><th>Failure mode</th></tr></thead>
+      <tbody>
+        <tr><td>Rust-name convention</td><td>Cheap conventional string enums</td><td>Invents values and misclassifies generated userdata conversion</td></tr>
+        <tr><td>HIR spelling patterns</td><td>Simple literal branches and direct table writes</td><td>Source-shape coupling; misses constants/helpers and directional meaning</td></tr>
+        <tr><td><strong>Resolved semantic trace</strong></td><td>Actual typed operations, constants, branches, table writes, and direction</td><td>Unknown static effects become explicit unsupported diagnostics</td></tr>
+      </tbody>
+    </table>
+  </section>
+</main>
+
+<script>
+const ConversionLab = (() => {
+  const strategies = {
+    names: { name: "Rust-name convention", note: "snake_case every enum variant" },
+    hir: { name: "HIR spelling patterns", note: "scan source-shaped expressions" },
+    semantic: { name: "Resolved semantic trace", note: "interpret typed conversion effects" }
+  };
+
+  const cases = {
+    asymmetric: {
+      name: "Renamed, asymmetric strings",
+      note: "produces two names; accepts a legacy third",
+      source: `enum Job { Queued, InFlight }
+IntoLua: Queued => "queued", InFlight => "running"
+FromLua: "queued" => Queued, "running" | "legacy" => InFlight`,
+      expected: { into: `"queued" | "running"`, from: `"queued" | "running" | "legacy"`, evidence: "resolved string construction and accepted match alternatives" }
+    },
+    numeric: {
+      name: "Numeric wire values",
+      note: "Rust variants map to integers",
+      source: `enum Priority { Low, High }
+IntoLua: Low => 1, High => 5
+FromLua: 1 => Low, 5 => High`,
+      expected: { into: "1 | 5", from: "1 | 5", evidence: "resolved integer Value construction and integer match patterns" }
+    },
+    table: {
+      name: "Structured table",
+      note: "fields, not variant names, define Lua shape",
+      source: `struct Point { x: f64, y: f64 }
+IntoLua:
+  table.set("x", self.x)
+  table.set("y", self.y)
+FromLua:
+  Point { x: table.get("x")?, y: table.get("y")? }`,
+      expected: { into: "{ x: number, y: number }", from: "{ x: number, y: number }", evidence: "resolved table creation, static keys, set/get value types" }
+    },
+    helper: {
+      name: "Local helper and constants",
+      note: "wire values are outside the impl body",
+      source: `const WAITING: &str = "waiting";
+fn wire_name(state: &State) -> &'static str {
+  match state { State::Waiting => WAITING, State::Done => "done" }
+}
+IntoLua: lua.create_string(wire_name(&self))`,
+      expected: { into: `"waiting" | "done"`, from: "—", evidence: "local-call traversal plus rustc constant evaluation" }
+    },
+    derived_userdata: {
+      name: "Derived FromLua userdata",
+      note: "generated clone is not a string enum",
+      source: `#[derive(mlua::FromLua)]
+enum Handle { Open(Resource), Closed }
+
+Expansion borrows Value::UserData and clones Handle.`,
+      expected: { into: "—", from: "userdata<Handle>", evidence: "resolved AnyUserData borrow/clone operations for Self" }
+    },
+    dynamic_string: {
+      name: "Runtime-computed string",
+      note: "exact scalar type; no finite literal claim",
+      source: `IntoLua for Label:
+  Value::String(lua.create_string(self.runtime_label())?)`,
+      expected: { into: "string", from: "—", evidence: "resolved string construction; runtime value is intentionally non-finite" }
+    },
+    unavailable: {
+      name: "Unavailable external helper",
+      note: "static semantics cannot be inspected",
+      source: `IntoLua for Token:
+  external_codec::encode(self, lua)`,
+      expected: { into: "unsupported", from: "—", evidence: "external body unavailable; no proven Lua-value operation" }
+    }
+  };
+
+  const initial = Object.freeze({ strategy: "semantic", caseId: "asymmetric", result: null, change: "Ready to analyze", walkthrough: "direction", step: 0 });
+
+  function analyze(strategyId, caseId) {
+    const item = cases[caseId];
+    if (strategyId === "semantic") {
+      const unsupported = caseId === "unavailable";
+      return {
+        status: unsupported ? "unsupported" : "exact",
+        into: item.expected.into,
+        from: item.expected.from,
+        evidence: item.expected.evidence,
+        publication: unsupported ? "Stop complete generation with a source-linked unsupported-conversion diagnostic." : "Keep the directional contract; publication may continue if every other export is complete."
+      };
+    }
+    if (strategyId === "names") {
+      const guesses = {
+        asymmetric: `"queued" | "in_flight"`, numeric: `"low" | "high"`, table: "Point", helper: `"waiting" | "done"`,
+        derived_userdata: `"open" | "closed"`, dynamic_string: "Label", unavailable: "Token"
+      };
+      return { status: "wrong", into: guesses[caseId], from: guesses[caseId], evidence: "Rust item and variant identifiers only", publication: "Would publish an invented contract. This violates exact generation." };
+    }
+    const direct = new Set(["asymmetric", "numeric", "table", "dynamic_string"]);
+    if (direct.has(caseId)) {
+      const losesDirection = caseId === "asymmetric";
+      return {
+        status: losesDirection ? "wrong" : "exact",
+        into: item.expected.into,
+        from: losesDirection ? item.expected.into : item.expected.from,
+        evidence: "literal and constructor spellings visible directly in the impl body",
+        publication: losesDirection ? "Would erase the accepted legacy input and publish the wrong parameter contract." : "Works for this spelling, but the same semantics expressed through helpers are not stable."
+      };
+    }
+    return { status: "unsupported", into: "unknown", from: "unknown", evidence: "required meaning is outside the recognized source shape", publication: "Must stop if strict; any fallback would silently turn unsupported semantics into invented output." };
+  }
+
+  function reduce(state, action) {
+    switch (action.type) {
+      case "strategy": return { ...state, strategy: action.id, result: null, change: `Authority changed to ${strategies[action.id].name}` };
+      case "case": return { ...state, caseId: action.id, result: null, change: `Conversion changed to ${cases[action.id].name}` };
+      case "analyze": return { ...state, result: analyze(state.strategy, state.caseId), change: `Analyzed ${cases[state.caseId].name}` };
+      case "walkthrough": return { ...initial, walkthrough: action.id, change: `Started ${action.id} walkthrough` };
+      case "walk-step": {
+        const selected = action.action.type === "analyze" ? state : reduce(state, action.action);
+        const analyzed = action.action.type === "analyze" ? reduce(selected, action.action) : selected;
+        return { ...analyzed, step: state.step + 1 };
+      }
+      case "reset": return { ...initial };
+      default: return state;
+    }
+  }
+
+  return { strategies, cases, initial, reduce };
+})();
+
+const walkthroughs = {
+  direction: {
+    label: "Direction matters",
+    description: "Watch one Rust type produce two strings while accepting a third legacy value. A single alias cannot describe both call directions.",
+    steps: [
+      ["Select name guessing", { type:"strategy", id:"names" }], ["Select asymmetric conversion", { type:"case", id:"asymmetric" }], ["Analyze the guess", { type:"analyze" }],
+      ["Switch to semantic trace", { type:"strategy", id:"semantic" }], ["Analyze actual directions", { type:"analyze" }]
+    ]
+  },
+  structures: {
+    label: "Values are not names",
+    description: "Try numeric and table conversions. The Lua surface comes from conversion effects, not the fact that the Rust owner is an enum or struct.",
+    steps: [
+      ["Use semantic trace", { type:"strategy", id:"semantic" }], ["Select numeric values", { type:"case", id:"numeric" }], ["Analyze numbers", { type:"analyze" }],
+      ["Select table conversion", { type:"case", id:"table" }], ["Analyze table fields", { type:"analyze" }]
+    ]
+  },
+  evidence: {
+    label: "Dynamic vs unsupported",
+    description: "A runtime string is still exactly a string. An inaccessible helper is different: its static meaning is unknown and complete publication must stop.",
+    steps: [
+      ["Use semantic trace", { type:"strategy", id:"semantic" }], ["Select runtime string", { type:"case", id:"dynamic_string" }], ["Analyze known scalar", { type:"analyze" }],
+      ["Select external helper", { type:"case", id:"unavailable" }], ["Analyze missing evidence", { type:"analyze" }]
+    ]
+  },
+  generated: {
+    label: "Generated userdata clone",
+    description: "The mlua FromLua derive for an enum clones userdata. Naming conventions misclassify it as a string union.",
+    steps: [
+      ["Use name guessing", { type:"strategy", id:"names" }], ["Select derived conversion", { type:"case", id:"derived_userdata" }], ["Analyze the guess", { type:"analyze" }],
+      ["Use semantic trace", { type:"strategy", id:"semantic" }], ["Analyze generated operations", { type:"analyze" }]
+    ]
+  }
+};
+
+let state = { ...ConversionLab.initial };
+const $ = id => document.getElementById(id);
+
+function dispatch(action) { state = ConversionLab.reduce(state, action); render(); }
+
+function renderButtons(container, items, selected, type) {
+  container.innerHTML = "";
+  Object.entries(items).forEach(([id,item]) => {
+    const button = document.createElement("button");
+    button.className = `${type} ${selected === id ? "active" : ""}`;
+    button.innerHTML = `<strong>${item.name}</strong><small>${item.note}</small>`;
+    button.onclick = () => dispatch({ type, id });
+    container.appendChild(button);
+  });
+}
+
+function render() {
+  renderButtons($("strategies"), ConversionLab.strategies, state.strategy, "strategy");
+  renderButtons($("cases"), ConversionLab.cases, state.caseId, "case");
+  const strategy = ConversionLab.strategies[state.strategy];
+  const item = ConversionLab.cases[state.caseId];
+  const result = state.result || { status:"not analyzed", into:"—", from:"—", evidence:"Choose Analyze to apply the selected authority.", publication:"No decision yet." };
+  $("authority").textContent = strategy.name;
+  $("status").innerHTML = `<span class="status ${result.status.replace(" ","-")}">${result.status}</span>`;
+  $("into").textContent = result.into;
+  $("from").textContent = result.from;
+  $("evidence").textContent = result.evidence;
+  $("publication").textContent = result.publication;
+  $("change").textContent = state.change;
+  $("source").textContent = item.source;
+  renderWalkthrough();
+}
+
+function renderTabs() {
+  $("tabs").innerHTML = "";
+  Object.entries(walkthroughs).forEach(([id,walk]) => {
+    const button = document.createElement("button");
+    button.className = state.walkthrough === id ? "active" : "";
+    button.textContent = walk.label;
+    button.onclick = () => dispatch({ type:"walkthrough", id });
+    $("tabs").appendChild(button);
+  });
+}
+
+function renderWalkthrough() {
+  renderTabs();
+  const walk = walkthroughs[state.walkthrough];
+  $("walkthrough").innerHTML = `<p>${walk.description}</p><div class="steps"></div>`;
+  const steps = $("walkthrough").querySelector(".steps");
+  walk.steps.forEach(([label,action],index) => {
+    const button = document.createElement("button");
+    button.textContent = `${index + 1}. ${label}`;
+    button.className = index < state.step ? "done" : "";
+    button.disabled = index !== state.step;
+    button.onclick = () => dispatch({ type:"walk-step", action });
+    steps.appendChild(button);
+  });
+  const reset = document.createElement("button");
+  reset.textContent = "Restart walkthrough";
+  reset.onclick = () => dispatch({ type:"walkthrough", id:state.walkthrough });
+  steps.appendChild(reset);
+}
+
+$("analyze").onclick = () => dispatch({ type:"analyze" });
+render();
+</script>
+</body>
+</html>
