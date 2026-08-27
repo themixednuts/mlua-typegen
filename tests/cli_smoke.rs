@@ -212,6 +212,7 @@ fn run_typegen_with(fixture: &Path, output_dir: &Path, options: &[&str]) -> std:
         .arg("--output")
         .arg(output_dir)
         .args(options)
+        .env("CARGO_TERM_COLOR", "never")
         .env("MLUA_TYPEGEN_TRACE", "1")
         .current_dir(fixture)
         .output()
