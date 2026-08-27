@@ -52,34 +52,42 @@ Vec2["components"] = function(self) end
 
 ## Install
 
-Requires Rust 1.98 on a rustup-managed nightly because the driver links against rustc internals. Your project can still be stable Rust; `mlua-typegen` uses its own pinned nightly toolchain when it runs.
+If Rust came from [rustup](https://rustup.rs), the installer handles everything else. It installs the pinned private nightly and compiler components without changing your default toolchain.
 
-The supported toolchain is `nightly-2026-06-30` (`rustc 1.98.0-nightly`). The repository pins this version so rustc-private API changes in later nightlies cannot break builds without warning.
+Linux and macOS:
 
 ```bash
-cargo +nightly-2026-06-30 install --git https://github.com/themixednuts/mlua-typegen
+curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/themixednuts/mlua-typegen/main/scripts/install.sh | sh
 ```
 
-No separate component setup is required. The repository declares `rustc-dev` and the Unix LLVM runtime in `rust-toolchain.toml`, and the build script installs either with rustup if it is missing.
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/themixednuts/mlua-typegen/main/scripts/install.ps1 | iex
+```
+
+The installer builds `cargo-mlua-typegen` and its rustc driver once. Later runs check the private toolchain and restore a missing component automatically. Your project can keep using stable Rust.
 
 ## Usage
 
 ```bash
 # Generate ./lua-types/mlua-typegen.lua
-mlua-typegen
+cargo mlua-typegen
 
 # Specify output directory
-mlua-typegen --output types/
+cargo mlua-typegen --output types/
 
 # Target a specific crate in a workspace
-mlua-typegen -p my-plugin-crate
+cargo mlua-typegen -p my-plugin-crate
 
 # Generate EmmyLua-flavored annotations
-mlua-typegen --emmylua
+cargo mlua-typegen --emmylua
 
 # Use a non-default workspace mapping file
-mlua-typegen --config config/mlua-typegen.toml
+cargo mlua-typegen --config config/mlua-typegen.toml
 ```
+
+Run `cargo mlua-typegen --help` for generator options. Cargo package and workspace flags pass through to the internal `cargo check`.
 
 Each successful run publishes one complete `mlua-typegen.lua` snapshot. Compiler
 processes write only to private per-run report directories; a failed build leaves

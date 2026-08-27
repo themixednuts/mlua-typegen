@@ -219,8 +219,7 @@ EmmyLua-specific features (`(exact)`, `@operator`) can be opt-in via CLI flags l
 ## Usage
 
 ```bash
-# Install (requires nightly to build the tool itself)
-cargo +nightly install mlua-typegen
+# Install with scripts/install.sh or scripts/install.ps1
 
 # Run against your project (your project can be on stable)
 cargo mlua-typegen --output lua/types/
@@ -229,7 +228,7 @@ cargo mlua-typegen --output lua/types/
 cargo mlua-typegen -p my-plugin-crate --output lua/types/
 ```
 
-The `rust-toolchain.toml` and build script handle `rustc-dev` plus the Unix LLVM runtime; users should not need a separate component setup step.
+The platform installer provisions the pinned private toolchain and installs the Cargo subcommand. Each run checks the toolchain and repairs missing compiler components before invoking the driver. This does not change the user's default toolchain.
 
 The generated `lua/types/mlua-typegen.lua` snapshot lives in a directory that can
 be added to your LSP's library paths:

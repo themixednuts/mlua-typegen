@@ -14,6 +14,22 @@ jobs:
         with:
           toolchain: nightly-2026-06-30
           components: rustc-dev,llvm-tools-preview,rustfmt,clippy
+      - name: Check installer syntax
+        run: sh -n scripts/install.sh
+      - name: Check PowerShell installer syntax
+        shell: pwsh
+        run: |
+          $errors = $null
+          $tokens = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path scripts/install.ps1),
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | Out-String | Write-Error
+            exit 1
+          }
       - run: cargo +nightly-2026-06-30 fmt --all -- --check
       - run: cargo +nightly-2026-06-30 clippy --all-targets -- -D warnings
       - run: cargo +nightly-2026-06-30 test --all-targets

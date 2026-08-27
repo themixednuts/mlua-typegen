@@ -67,7 +67,7 @@ compatibility-matrix integration entrypoint
   -> for each selected CompatibilityLane
        -> cargo metadata --locked --manifest-path <fixture>
        -> assert resolved mlua package == lane.locked
-       -> mlua-typegen --manifest-path <fixture>/Cargo.toml --locked
+       -> cargo mlua-typegen --manifest-path <fixture>/Cargo.toml --locked
             -> normal CLI/config snapshot/coordinator path
             -> real rustc driver over that lane's upstream mlua HIR
             -> semantic assembly and dialect validation
@@ -77,7 +77,7 @@ compatibility-matrix integration entrypoint
 ```
 
 The verifier owns matrix parsing and subprocess failure translation. Cargo owns
-dependency resolution. The normal `mlua-typegen` entrypoint owns extraction and
+dependency resolution. The normal `cargo mlua-typegen` entrypoint owns extraction and
 publication. Fixtures do not contain adapter code that changes `mlua` source
 forms.
 

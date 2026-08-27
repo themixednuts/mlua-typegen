@@ -16,7 +16,7 @@ lua = "any"
     )
     .unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_mlua-typegen"))
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-mlua-typegen"))
         .args(["--config", config.to_str().unwrap()])
         .current_dir(root.path())
         .output()

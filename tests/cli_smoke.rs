@@ -208,7 +208,7 @@ fn run_typegen(fixture: &Path, output_dir: &Path) -> std::process::Output {
 }
 
 fn run_typegen_with(fixture: &Path, output_dir: &Path, options: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_mlua-typegen"))
+    Command::new(env!("CARGO_BIN_EXE_cargo-mlua-typegen"))
         .arg("--output")
         .arg(output_dir)
         .args(options)

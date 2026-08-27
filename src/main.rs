@@ -1,6 +1,5 @@
 use std::env;
 use std::ffi::OsString;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus};
 
@@ -15,10 +14,44 @@ use mlua_typegen::{
 };
 use thiserror::Error;
 
+mod toolchain;
+mod toolchain_spec;
+
 const BUILD_RUSTUP_TOOLCHAIN: &str = env!("MLUA_TYPEGEN_RUSTUP_TOOLCHAIN");
+const HELP: &str = r#"Generate exact Lua types from an mlua project
+
+Usage: cargo mlua-typegen [OPTIONS] [CARGO OPTIONS]
+
+Options:
+  -o, --output <DIRECTORY>  Output directory [default: lua-types]
+      --config <PATH>       Mapping configuration [default: mlua-typegen.toml]
+      --emmylua             Emit EmmyLua annotations instead of LuaLS annotations
+  -h, --help                Print help
+  -V, --version             Print version
+
+Cargo package and workspace options such as -p and --workspace pass through.
+Use -- before a Cargo option that conflicts with an option above.
+"#;
 
 fn main() -> ExitCode {
-    match run() {
+    let action = match CliOptions::parse(env::args_os().skip(1)) {
+        Ok(action) => action,
+        Err(error) => return report_error(&error),
+    };
+
+    let options = match action {
+        CliAction::Help => {
+            print!("{HELP}");
+            return ExitCode::SUCCESS;
+        }
+        CliAction::Version => {
+            println!("mlua-typegen {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
+        CliAction::Generate(options) => options,
+    };
+
+    match run(options) {
         Ok(published) => {
             eprintln!(
                 "mlua-typegen: atomically published {} compiler units to {}",
@@ -27,23 +60,24 @@ fn main() -> ExitCode {
             );
             ExitCode::SUCCESS
         }
-        Err(error) => {
-            eprintln!("error: {error}");
-            if let Some(snapshot) = error.preserved_snapshot() {
-                eprintln!(
-                    "mlua-typegen: incomplete run; preserved previous snapshot at {}",
-                    snapshot.display()
-                );
-            } else if error.is_incomplete_run() {
-                eprintln!("mlua-typegen: incomplete run; no snapshot was published");
-            }
-            ExitCode::FAILURE
-        }
+        Err(error) => report_error(&error),
     }
 }
 
-fn run() -> Result<PublishedSnapshot, AppError> {
-    let options = CliOptions::parse(env::args_os().skip(1))?;
+fn report_error(error: &AppError) -> ExitCode {
+    eprintln!("error: {error}");
+    if let Some(snapshot) = error.preserved_snapshot() {
+        eprintln!(
+            "mlua-typegen: incomplete run; preserved previous snapshot at {}",
+            snapshot.display()
+        );
+    } else if error.is_incomplete_run() {
+        eprintln!("mlua-typegen: incomplete run; no snapshot was published");
+    }
+    ExitCode::FAILURE
+}
+
+fn run(options: CliOptions) -> Result<PublishedSnapshot, AppError> {
     let output_dir = absolute_path(&options.output_dir)?;
     let output_lock = OutputLock::acquire(&output_dir)?;
     let workspace = RunWorkspace::create()?;
@@ -66,12 +100,10 @@ fn run() -> Result<PublishedSnapshot, AppError> {
     };
     let config_snapshot = workspace.snapshot_config(&resolved_config.snapshot_bytes()?)?;
     let driver = find_driver()?;
+    let runtime = toolchain::RustcRuntime::prepare(BUILD_RUSTUP_TOOLCHAIN, &driver)?;
 
-    let mut command = Command::new("rustup");
+    let mut command = runtime.cargo_command()?;
     command
-        .arg("run")
-        .arg(BUILD_RUSTUP_TOOLCHAIN)
-        .arg("cargo")
         .arg("check")
         .args(&options.cargo_args)
         .env("RUSTC_WRAPPER", &driver)
@@ -82,10 +114,6 @@ fn run() -> Result<PublishedSnapshot, AppError> {
         .env("CARGO_TARGET_DIR", workspace.cargo_target_dir())
         .env("RUSTUP_TOOLCHAIN", BUILD_RUSTUP_TOOLCHAIN);
 
-    if let Some(sysroot_lib) = find_sysroot_lib_dir(BUILD_RUSTUP_TOOLCHAIN)? {
-        stage_driver_runtime(&driver, &sysroot_lib)?;
-        prepend_lib_path(&mut command, &sysroot_lib)?;
-    }
     if options.emit_emmylua {
         command.env("MLUA_TYPEGEN_EMMYLUA", "1");
     } else {
@@ -131,6 +159,13 @@ fn run() -> Result<PublishedSnapshot, AppError> {
 }
 
 #[derive(Debug)]
+enum CliAction {
+    Generate(CliOptions),
+    Help,
+    Version,
+}
+
+#[derive(Debug)]
 struct CliOptions {
     output_dir: PathBuf,
     config_path: Option<PathBuf>,
@@ -139,15 +174,21 @@ struct CliOptions {
 }
 
 impl CliOptions {
-    fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self, AppError> {
+    fn parse(args: impl IntoIterator<Item = OsString>) -> Result<CliAction, AppError> {
         let mut output_dir = PathBuf::from("lua-types");
         let mut emit_emmylua = false;
         let mut config_path = None;
         let mut cargo_args = Vec::new();
-        let mut args = args.into_iter();
+        let mut args = args.into_iter().peekable();
+
+        if args.peek().is_some_and(|arg| arg == "mlua-typegen") {
+            args.next();
+        }
 
         while let Some(argument) = args.next() {
             match argument.to_str() {
+                Some("--help" | "-h") => return Ok(CliAction::Help),
+                Some("--version" | "-V") => return Ok(CliAction::Version),
                 Some("--output" | "-o") => {
                     output_dir = args
                         .next()
@@ -162,16 +203,26 @@ impl CliOptions {
                             .ok_or(AppError::MissingConfig)?,
                     );
                 }
+                Some("--") => {
+                    cargo_args.extend(args.by_ref());
+                    break;
+                }
+                Some(argument) if argument.starts_with("--output=") => {
+                    output_dir = PathBuf::from(&argument["--output=".len()..]);
+                }
+                Some(argument) if argument.starts_with("--config=") => {
+                    config_path = Some(PathBuf::from(&argument["--config=".len()..]));
+                }
                 _ => cargo_args.push(argument),
             }
         }
 
-        Ok(Self {
+        Ok(CliAction::Generate(Self {
             output_dir,
             config_path,
             emit_emmylua,
             cargo_args,
-        })
+        }))
     }
 }
 
@@ -197,33 +248,8 @@ enum AppError {
     CurrentDirectory(#[source] std::io::Error),
     #[error("failed to locate the mlua-typegen executable")]
     CurrentExecutable(#[source] std::io::Error),
-    #[error("failed to query the `{toolchain}` sysroot")]
-    QuerySysroot {
-        toolchain: &'static str,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("the `{toolchain}` sysroot query failed with {status}: {stderr}")]
-    SysrootQueryFailed {
-        toolchain: &'static str,
-        status: ExitStatus,
-        stderr: String,
-    },
-    #[error("failed to inspect driver runtime directory `{}`", path.display())]
-    ReadRuntime {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to copy driver runtime `{}` to `{}`", source_path.display(), destination.display())]
-    CopyRuntime {
-        source_path: PathBuf,
-        destination: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("failed to construct the compiler library search path")]
-    LibraryPath(#[source] env::JoinPathsError),
+    #[error(transparent)]
+    Toolchain(#[from] toolchain::Error),
     #[error("failed to run cargo through rustup")]
     RunCargo(#[source] std::io::Error),
     #[error("cargo check failed with {status}")]
@@ -325,97 +351,6 @@ fn find_driver() -> Result<PathBuf, AppError> {
     Ok(PathBuf::from("mlua-typegen-driver"))
 }
 
-fn find_sysroot_lib_dir(toolchain: &'static str) -> Result<Option<PathBuf>, AppError> {
-    let output = Command::new("rustup")
-        .args(["run", toolchain, "rustc", "--print", "sysroot"])
-        .output()
-        .map_err(|source| AppError::QuerySysroot { toolchain, source })?;
-    if !output.status.success() {
-        return Err(AppError::SysrootQueryFailed {
-            toolchain,
-            status: output.status,
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        });
-    }
-
-    let sysroot = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
-    Ok([sysroot.join("bin"), sysroot.join("lib")]
-        .into_iter()
-        .find(|directory| directory.is_dir()))
-}
-
-fn prepend_lib_path(command: &mut Command, directory: &Path) -> Result<(), AppError> {
-    let variable = if cfg!(windows) {
-        "PATH"
-    } else if cfg!(target_os = "macos") {
-        "DYLD_LIBRARY_PATH"
-    } else {
-        "LD_LIBRARY_PATH"
-    };
-    let mut paths = vec![directory.to_owned()];
-    if let Some(current) = env::var_os(variable) {
-        paths.extend(env::split_paths(&current));
-    }
-    command.env(
-        variable,
-        env::join_paths(paths).map_err(AppError::LibraryPath)?,
-    );
-    Ok(())
-}
-
-fn stage_driver_runtime(driver: &Path, sysroot_lib: &Path) -> Result<(), AppError> {
-    if !cfg!(windows) || !driver.is_file() {
-        return Ok(());
-    }
-    let Some(driver_dir) = driver.parent() else {
-        return Ok(());
-    };
-    let entries = fs::read_dir(sysroot_lib).map_err(|source| AppError::ReadRuntime {
-        path: sysroot_lib.to_owned(),
-        source,
-    })?;
-
-    for entry in entries {
-        let entry = entry.map_err(|source| AppError::ReadRuntime {
-            path: sysroot_lib.to_owned(),
-            source,
-        })?;
-        let source_path = entry.path();
-        if source_path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            != Some("dll")
-        {
-            continue;
-        }
-        let destination = driver_dir.join(entry.file_name());
-        let needs_copy = match (fs::metadata(&source_path), fs::metadata(&destination)) {
-            (Ok(source), Ok(existing)) => source.len() != existing.len(),
-            (Ok(_), Err(error)) if error.kind() == std::io::ErrorKind::NotFound => true,
-            (Ok(_), Err(error)) => {
-                return Err(AppError::ReadRuntime {
-                    path: destination,
-                    source: error,
-                });
-            }
-            (Err(error), _) => {
-                return Err(AppError::ReadRuntime {
-                    path: source_path,
-                    source: error,
-                });
-            }
-        };
-        if needs_copy {
-            fs::copy(&source_path, &destination).map_err(|source| AppError::CopyRuntime {
-                source_path,
-                destination,
-                source,
-            })?;
-        }
-    }
-    Ok(())
-}
-
 fn pass_through_env(command: &mut Command, name: &str) {
     if let Some(value) = env::var_os(name) {
         command.env(name, value);
@@ -428,13 +363,15 @@ mod tests {
 
     #[test]
     fn parses_generator_options_without_consuming_cargo_arguments() {
-        let options = CliOptions::parse([
+        let CliAction::Generate(options) = CliOptions::parse([
             OsString::from("--emmylua"),
             OsString::from("--output"),
             OsString::from("generated"),
             OsString::from("--workspace"),
         ])
-        .unwrap();
+        .unwrap() else {
+            panic!("expected generation options");
+        };
 
         assert_eq!(options.output_dir, PathBuf::from("generated"));
         assert!(options.emit_emmylua);
@@ -445,5 +382,38 @@ mod tests {
     fn rejects_output_without_a_directory() {
         let error = CliOptions::parse([OsString::from("--output")]).unwrap_err();
         assert!(matches!(error, AppError::MissingOutput));
+    }
+
+    #[test]
+    fn accepts_cargo_subcommand_invocation_and_equals_options() {
+        let CliAction::Generate(options) = CliOptions::parse([
+            OsString::from("mlua-typegen"),
+            OsString::from("--output=generated"),
+            OsString::from("--config=config/typegen.toml"),
+            OsString::from("--"),
+            OsString::from("--release"),
+        ])
+        .unwrap() else {
+            panic!("expected generation options");
+        };
+
+        assert_eq!(options.output_dir, PathBuf::from("generated"));
+        assert_eq!(
+            options.config_path,
+            Some(PathBuf::from("config/typegen.toml"))
+        );
+        assert_eq!(options.cargo_args, [OsString::from("--release")]);
+    }
+
+    #[test]
+    fn cargo_help_and_version_are_informational_actions() {
+        assert!(matches!(
+            CliOptions::parse([OsString::from("mlua-typegen"), OsString::from("--help")]),
+            Ok(CliAction::Help)
+        ));
+        assert!(matches!(
+            CliOptions::parse([OsString::from("mlua-typegen"), OsString::from("--version")]),
+            Ok(CliAction::Version)
+        ));
     }
 }

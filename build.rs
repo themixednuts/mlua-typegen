@@ -1,11 +1,15 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[path = "src/toolchain_spec.rs"]
+mod toolchain_spec;
+
 const MIN_SUPPORTED_RUSTC_MINOR: u32 = 98;
 const MIN_SUPPORTED_NIGHTLY: &str = "nightly-2026-06-30";
 const TESTED_CURRENT_NIGHTLY: &str = "nightly-2026-06-30";
 
 fn main() {
+    println!("cargo:rerun-if-changed=src/toolchain_spec.rs");
     println!("cargo:rerun-if-env-changed=RUSTC");
     println!("cargo:rerun-if-env-changed=RUSTUP_TOOLCHAIN");
 
@@ -145,13 +149,11 @@ fn ensure_supported_nightly(rustc: &RustcInfo) {
 }
 
 fn ensure_rustc_components(rustc: &RustcInfo) {
-    let mut missing = Vec::new();
-    if !has_rustc_dev(rustc) {
-        missing.push("rustc-dev");
-    }
-    if cfg!(unix) && !has_rustc_llvm_runtime(rustc) {
-        missing.push("llvm-tools-preview");
-    }
+    let missing = toolchain_spec::required_components()
+        .iter()
+        .copied()
+        .filter(|component| !has_component(rustc, component))
+        .collect::<Vec<_>>();
 
     if missing.is_empty() {
         return;
@@ -170,18 +172,29 @@ fn ensure_rustc_components(rustc: &RustcInfo) {
         .status();
 
     if matches!(status, Ok(status) if status.success())
-        && has_rustc_dev(rustc)
-        && (!cfg!(unix) || has_rustc_llvm_runtime(rustc))
+        && toolchain_spec::required_components()
+            .iter()
+            .all(|component| has_component(rustc, component))
     {
         return;
     }
 
     panic!(
-        "mlua-typegen needs rustc-dev and, on Unix, llvm-tools-preview for toolchain `{}`. \
-         Automatic installation failed; run `rustup component add rustc-dev \
-         llvm-tools-preview --toolchain {}`.",
-        rustc.toolchain, rustc.toolchain
+        "mlua-typegen needs {} for toolchain `{}`. Automatic installation failed; run \
+         `rustup component add {} --toolchain {}`.",
+        toolchain_spec::required_components().join(" and "),
+        rustc.toolchain,
+        toolchain_spec::required_components().join(" "),
+        rustc.toolchain
     );
+}
+
+fn has_component(rustc: &RustcInfo, component: &str) -> bool {
+    match component {
+        toolchain_spec::RUSTC_DEV => has_rustc_dev(rustc),
+        toolchain_spec::LLVM_TOOLS => has_rustc_llvm_runtime(rustc),
+        _ => false,
+    }
 }
 
 fn emit_rustc_api_cfgs(rustc: &RustcInfo) {

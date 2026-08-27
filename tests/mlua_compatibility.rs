@@ -108,7 +108,7 @@ fn verify_lane(lane: &CompatibilityLane) {
     let expected = std::fs::read_to_string(fixture_root().join(&lane.expected)).unwrap();
     for dialect in [None, Some("--emmylua")] {
         let output_root = tempfile::tempdir().unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_mlua-typegen"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-mlua-typegen"));
         command
             .args(["--output"])
             .arg(output_root.path())
