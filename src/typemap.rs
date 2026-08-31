@@ -11,6 +11,8 @@ pub fn has_native_mapping(path: &str) -> bool {
             | "alloc::vec::Vec"
             | "std::option::Option"
             | "core::option::Option"
+            | "std::result::Result"
+            | "core::result::Result"
             | "std::collections::HashMap"
             | "std::collections::hash_map::HashMap"
             | "std::collections::BTreeMap"
@@ -91,6 +93,7 @@ pub fn map_rust_type(path: &str, arguments: &[LuaType]) -> LuaType {
                 item => LuaType::Optional(Box::new(item)),
             })
         }
+        "std::result::Result" | "core::result::Result" => unary(path, arguments, |success| success),
         "std::collections::HashMap"
         | "std::collections::hash_map::HashMap"
         | "std::collections::BTreeMap"

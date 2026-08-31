@@ -24,6 +24,14 @@ fn maps_standard_transparent_and_collection_types() {
     );
     assert_eq!(
         map_rust_type(
+            "std::result::Result",
+            &[LuaType::String, LuaType::Class("LuaError".into())]
+        ),
+        LuaType::String,
+        "callback errors are thrown and never become Lua values"
+    );
+    assert_eq!(
+        map_rust_type(
             "std::collections::HashMap",
             &[LuaType::String, LuaType::Boolean]
         ),
